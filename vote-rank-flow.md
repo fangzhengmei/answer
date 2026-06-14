@@ -1185,3 +1185,395 @@ WHERE user_id = ?
 | 声望增长榜 | [activity_repo.go](file:///d:/fz/0601-1/solo-dogfeeding/code/63-answer/internal/repo/activity_common/activity_repo.go) | L147-L163 |
 | 投票活跃度榜 | [activity_repo.go](file:///d:/fz/0601-1/solo-dogfeeding/code/63-answer/internal/repo/activity_common/activity_repo.go) | L165-L191 |
 | 排行榜编排 | [user_service.go](file:///d:/fz/0601-1/solo-dogfeeding/code/63-answer/internal/service/content/user_service.go) | L790-L823 |
+| **运行时维度** | | |
+| 配置缓存(repo) | [config_repo.go](file:///d:/fz/0601-1/solo-dogfeeding/code/63-answer/internal/repo/config/config_repo.go) | L48-L143 |
+| 配置服务层 | [config_service.go](file:///d:/fz/0601-1/solo-dogfeeding/code/63-answer/internal/service/config/config_service.go) | L50-L118 |
+| 外部通知处理 | [external_notification.go](file:///d:/fz/0601-1/solo-dogfeeding/code/63-answer/internal/service/notification/external_notification.go) | L39-L110 |
+| 新回答邮件通知 | [new_answer_notification.go](file:///d:/fz/0601-1/solo-dogfeeding/code/63-answer/internal/service/notification/new_answer_notification.go) | L32-L82 |
+| 邀请回答邮件通知 | [invite_answer_notification.go](file:///d:/fz/0601-1/solo-dogfeeding/code/63-answer/internal/service/notification/invite_answer_notification.go) | L32-L82 |
+| 新评论邮件通知 | [new_comment_notification.go](file:///d:/fz/0601-1/solo-dogfeeding/code/63-answer/internal/service/notification/new_comment_notification.go) | L32-L82 |
+| 新问题邮件通知 | [new_question_notification.go](file:///d:/fz/0601-1/solo-dogfeeding/code/63-answer/internal/service/notification/new_question_notification.go) | L44-L115 |
+| 邮件发送+模板 | [email_service.go](file:///d:/fz/0601-1/solo-dogfeeding/code/63-answer/internal/service/export/email_service.go) | L123-L157, L168-L360 |
+| 邮件模板数据 | [email_template.go](file:///d:/fz/0601-1/solo-dogfeeding/code/63-answer/internal/schema/email_template.go) | L28-L145 |
+| 用户通知偏好 | [user_notification_config_service.go](file:///d:/fz/0601-1/solo-dogfeeding/code/63-answer/internal/service/user_notification_config/user_notification_config_service.go) | L42-L115 |
+| 用户通知偏好实体 | [user_notification_config_entity.go](file:///d:/fz/0601-1/solo-dogfeeding/code/63-answer/internal/entity/user_notification_config_entity.go) | L25-L33 |
+| 队列单测 | [queue_test.go](file:///d:/fz/0601-1/solo-dogfeeding/code/63-answer/internal/base/queue/queue_test.go) | L36-L253 |
+
+---
+
+## 第五部分 运行时维度
+
+---
+
+## 十九、声望奖励配置修改后的生效机制与缓存刷新
+
+### 19.1 配置读取的两级缓存
+
+声望奖励配置（如 `rank.question.vote_up`、`rank.question.voted_up`、`daily_rank_limit`）存储在 `config` 表中，通过 [ConfigRepo](file:///d:/fz/0601-1/solo-dogfeeding/code/63-answer/internal/repo/config/config_repo.go) 读取，采用**先查 Redis 缓存、未命中再查 DB 并回填**的模式。
+
+#### GetConfigByKey 的读取路径（[config_repo.go:L75-L100](file:///d:/fz/0601-1/solo-dogfeeding/code/63-answer/internal/repo/config/config_repo.go#L75-L100)）
+
+```
+步骤1: 尝试从 Redis 读取
+  cacheKey = "config:kc:" + key
+  → 命中: 反序列化 JSON 返回
+  → 未命中: 继续步骤2
+
+步骤2: 查询数据库
+  SELECT * FROM config WHERE key = ?
+  → 不存在: 返回 error
+  → 存在: 继续步骤3
+
+步骤3: 回填 Redis 缓存
+  SET cacheKey = config.JsonString(), TTL = ConfigCacheTime
+```
+
+**缓存 TTL**：[ConfigCacheTime = 1 * time.Hour](file:///d:/fz/0601-1/solo-dogfeeding/code/63-answer/internal/base/constant/cache_key.go#L42)
+
+**缓存 Key 格式**：
+| 查询方式 | Redis Key | 格式 |
+|----------|-----------|------|
+| 按 Key 查 | `config:kc:{key}` | 如 `config:kc:rank.question.vote_up` |
+| 按 ID 查 | `config:ic:{id}` | 如 `config:ic:42` |
+
+### 19.2 配置修改的缓存刷新
+
+管理员在后台修改配置时，走 [UpdateConfig](file:///d:/fz/0601-1/solo-dogfeeding/code/63-answer/internal/repo/config/config_repo.go#L114-L143)：
+
+```go
+func (cr configRepo) UpdateConfig(ctx, key, value string) error {
+    // 1. 查旧记录获取 ID
+    oldConfig := &entity.Config{Key: key}
+    exist, _ := cr.data.DB.Get(oldConfig)
+
+    // 2. UPDATE config SET value = ? WHERE id = ?
+    cr.data.DB.ID(oldConfig.ID).Update(&entity.Config{Value: value})
+
+    // 3. 同时刷新两个缓存 Key
+    oldConfig.Value = value
+    cacheVal := oldConfig.JsonString()
+    cr.data.Cache.SetString(ctx, "config:kc:"+key, cacheVal, ConfigCacheTime)
+    cr.data.Cache.SetString(ctx, "config:ic:"+oldConfig.ID, cacheVal, ConfigCacheTime)
+}
+```
+
+**关键性质**：
+- 更新 DB 后**立即刷新 Redis 缓存**，不存在延迟窗口
+- 两个缓存 Key（按 key 和按 id）**同时刷新**，不会出现不一致
+- 缓存刷新失败仅 `log.Error(err)`，不影响主流程返回
+
+### 19.3 声望配置修改的实际生效时序
+
+以管理员将 `rank.question.voted_up` 从 `10` 改为 `15` 为例：
+
+```
+管理员提交修改
+  │
+  ▼
+configRepo.UpdateConfig("rank.question.voted_up", "15")
+  ├─ UPDATE config SET value='15' WHERE key='rank.question.voted_up'
+  ├─ SET Redis "config:kc:rank.question.voted_up" = {id:42, key:..., value:"15"}
+  └─ SET Redis "config:ic:42" = {id:42, key:..., value:"15"}
+  │
+  ▼ (立即生效)
+下一次投票: getActivities()
+  → configService.GetConfigByKey("rank.question.voted_up")
+  → Redis 命中 → 返回 value=15
+  → Activity.Rank = 15   ← 新值立即生效
+```
+
+**注意**：已存在的 Activity 记录的 `Rank` 字段**不会自动更新**。修改配置只影响**未来新创建的 Activity**，已入库的 Rank 值保持不变。这是有意的设计——历史声望变更应反映当时的规则。
+
+### 19.4 配置读取失败的降级
+
+[getActivities](file:///d:/fz/0601-1/solo-dogfeeding/code/63-answer/internal/service/content/vote_service.go#L280-L297) 中配置读取失败的处理：
+
+```go
+cfg, err := configService.GetConfigByKey(ctx, action)
+if err != nil {
+    log.Warnf("get config by key error: %v", err)
+    // 不返回 error，Activity.Rank 保持为 0（默认值）
+}
+activity.Rank = cfg.GetIntValue()
+```
+
+**降级行为**：配置读取失败 → `Rank = 0` → 投票仍然成功，但本次不增加声望。用户不会收到错误提示，但声望丢失。
+
+### 19.5 GetConfigByKeyFromDB（绕过缓存）
+
+[GetStringValueFromDB](file:///d:/fz/0601-1/solo-dogfeeding/code/63-answer/internal/service/config/config_service.go#L69-L75) 提供了**绕过缓存直接查 DB** 的能力，但投票链路**不使用**此方法，始终走缓存路径。
+
+---
+
+## 二十、ExternalNotificationService 外部通知邮件链路
+
+### 20.1 投票不直接触发外部邮件
+
+**核心结论**：投票行为本身**不会**触发 `ExternalNotificationService` 的邮件发送。
+
+`ExternalNotificationService.Handler`（[external_notification.go:L74-L97](file:///d:/fz/0601-1/solo-dogfeeding/code/63-answer/internal/service/notification/external_notification.go#L74-L97)）只处理以下四种 `ExternalNotificationMsg`：
+
+| 触发条件 | 处理方法 | 邮件模板 |
+|----------|----------|----------|
+| `NewQuestionTemplateRawData != nil` | `handleNewQuestionNotification` | 新问题通知 |
+| `NewCommentTemplateRawData != nil` | `handleNewCommentNotification` | 新评论通知 |
+| `NewAnswerTemplateRawData != nil` | `handleNewAnswerNotification` | 新回答通知 |
+| `NewInviteAnswerTemplateRawData != nil` | `handleInviteAnswerNotification` | 邀请回答通知 |
+
+投票产生的 `ExternalNotificationMsg` 不携带以上任何 RawData 字段，因此 Handler 会走到 `log.Errorf("unknown notification message: %+v", msg)` 分支直接丢弃。
+
+### 20.2 外部通知的完整发送链路（以新回答为例）
+
+当有人回答问题时，外部通知的完整路径：
+
+```
+AnswerService.CreateAnswer
+  │
+  ▼
+notificationCommon.SendExternalNotification(
+  ReceiverUserID, ReceiverEmail, ReceiverLang,
+  NewAnswerTemplateRawData{...})
+  │
+  ▼
+noticequeue.ExternalService.Send(ExternalNotificationMsg)
+  │
+  ▼ (异步 goroutine)
+ExternalNotificationService.Handler
+  │
+  ▼
+handleNewAnswerNotification(ctx, msg)
+  │
+  ├─① 查询用户通知偏好
+  │   userNotificationConfigRepo.GetByUserIDAndSource(userID, InboxSource)
+  │   → 无配置: return nil（不发送）
+  │
+  ├─② 解析 channels JSON
+  │   channels = NewNotificationChannelsFormJson(config.Channels)
+  │   → 遍历每个 channel:
+  │     if !channel.Enable → continue
+  │     if channel.Key == "email" → 调 sendEmail
+  │
+  └─③ sendNewAnswerNotificationEmail
+       ├─ checkUserStatusBeforeNotification(userID)
+       │   → 用户不存在或已封禁: return（静默丢弃）
+       ├─ 设置接收者语言: ctx = context.WithValue(AcceptLanguage)
+       ├─ 渲染邮件模板: emailService.NewAnswerTemplate(ctx, rawData)
+       │   → title, body = translator.TrWithData(lang, templateKey, data)
+       └─ 发送邮件: emailService.SendAndSaveCodeWithTime(...)
+            ├─ emailRepo.SetCode(userID, code, content, 24h) // 保存退订码
+            └─ emailService.Send(toEmail, subject, body)
+                 ├─ GetEmailConfig() → 从 config 表读取 SMTP 配置
+                 ├─ SMTPHost 为空 → log.Warn("skip send email") → return
+                 ├─ gomail.NewMessage() 构造邮件
+                 ├─ gomail.NewDialer(host, port, user, pass)
+                 └─ d.DialAndSend(m)
+                      → 失败: log.Errorf("send email failed: %s", err)
+                      → 成功: log.Infof("send email success")
+```
+
+### 20.3 用户通知偏好筛选机制
+
+[UserNotificationConfig](file:///d:/fz/0601-1/solo-dogfeeding/code/63-answer/internal/entity/user_notification_config_entity.go#L25-L33) 实体：
+
+```sql
+CREATE TABLE user_notification_config (
+  id BIGINT PK AUTO_INCREMENT,
+  user_id BIGINT,        -- 用户 ID
+  source VARCHAR(64),    -- 通知来源: "inbox" / "all_new_question" / "all_new_question_for_following_tags"
+  channels TEXT,         -- JSON: [{"key":"email","enable":true}]
+  enabled BOOL,          -- 快速判断是否有任何启用渠道
+  UNIQUE KEY (user_id, source)
+)
+```
+
+**筛选流程**：
+1. 按 `(user_id, source=inbox)` 查询用户配置
+2. 无记录 → 不发送（默认关闭）
+3. 有记录 → 解析 `channels` JSON，遍历每个 channel
+4. `channel.Enable == false` → 跳过
+5. `channel.Key == "email"` → 触发邮件发送
+
+**注册默认配置**（[user_notification_config_service.go:L93-L97](file:///d:/fz/0601-1/solo-dogfeeding/code/63-answer/internal/service/user_notification_config/user_notification_config_service.go#L93-L97)）：
+```go
+func (us *UserNotificationConfigService) SetDefaultUserNotificationConfig(ctx, userIDs) {
+    us.userNotificationConfigRepo.Add(ctx, userIDs,
+        string(constant.InboxSource), `[{"key":"email","enable":true}]`)
+}
+```
+新注册用户默认开启邮件通知。
+
+### 20.4 邮件模板渲染
+
+[EmailService](file:///d:/fz/0601-1/solo-dogfeeding/code/63-answer/internal/service/export/email_service.go) 的模板渲染流程（以 NewAnswerTemplate 为例，[email_service.go:L233-L263](file:///d:/fz/0601-1/solo-dogfeeding/code/63-answer/internal/service/export/email_service.go#L233-L263)）：
+
+```
+步骤1: 获取站点信息（siteInfo.Name, siteInfo.SiteUrl, seoInfo.Permalink）
+步骤2: 构造模板数据结构
+  NewAnswerTemplateData{
+    SiteName:       siteInfo.Name,
+    DisplayName:    raw.AnswerUserDisplayName,
+    QuestionTitle:  raw.QuestionTitle,
+    AnswerUrl:      display.AnswerURL(permalink, siteUrl, questionID, title, answerID),
+    AnswerSummary:  raw.AnswerSummary,
+    UnsubscribeUrl: siteUrl + "/users/unsubscribe?code=" + unsubscribeCode,
+  }
+步骤3: 翻译渲染（按用户语言）
+  title = translator.TrWithData(lang, "email.new_answer.title", templateData)
+  body  = translator.TrWithData(lang, "email.new_answer.body", safeTemplateData)
+  // safeTemplateData 中对 HTML 展示字段做了 escapeEmailHTMLText
+步骤4: 返回 (title, body)
+```
+
+**XSS 防护**：`body` 模板中的 `SiteName`、`DisplayName`、`QuestionTitle`、`AnswerSummary` 等字段在渲染前通过 `html.EscapeString()` 转义，防止存储型 XSS 通过邮件传播。URL 字段（`AnswerUrl`、`UnsubscribeUrl`）不转义。
+
+### 20.5 SMTP 发送与失败重试
+
+[EmailService.Send](file:///d:/fz/0601-1/solo-dogfeeding/code/63-answer/internal/service/export/email_service.go#L123-L157)：
+
+```go
+func (es *EmailService) Send(ctx, toEmailAddr, subject, body string) {
+    ec, _ := es.GetEmailConfig(ctx)   // 每次发送都重新读取 SMTP 配置
+    if len(ec.SMTPHost) == 0 {
+        log.Warnf("smtp host is empty, skip send email")
+        return                        // 未配置 SMTP → 静默跳过
+    }
+
+    m := gomail.NewMessage()
+    m.SetHeader("From", fromName + " <" + fromEmail + ">")
+    m.SetHeader("To", toEmailAddr)
+    m.SetHeader("Subject", subject)
+    m.SetBody("text/html", body)
+
+    d := gomail.NewDialer(ec.SMTPHost, ec.SMTPPort, ec.SMTPUsername, ec.SMTPPassword)
+    if ec.IsSSL() { d.SSL = true }
+    if ec.IsTLS() { d.SSL = false }
+    if os.Getenv("SKIP_SMTP_TLS_VERIFY") != "" {
+        d.TLSConfig = &tls.Config{InsecureSkipVerify: true}
+    }
+
+    if err := d.DialAndSend(m); err != nil {
+        log.Errorf("send email to %s failed: %s", toEmailAddr, err)
+    } else {
+        log.Infof("send email to %s success", toEmailAddr)
+    }
+}
+```
+
+**失败重试机制**：
+- **无重试**。`DialAndSend` 失败后只 `log.Errorf`，邮件**永久丢失**
+- **无死信队列**：没有重入 noticequeue 或存 DB 待重发的逻辑
+- **无退避策略**：SMTP 连接失败后不会 exponential backoff
+- **环境变量绕过 TLS 验证**：`SKIP_SMTP_TLS_VERIFY=1` 可跳过 TLS 证书校验（仅限开发环境）
+
+### 20.6 投票与外部邮件的间接关联
+
+虽然投票不直接触发外部邮件，但投票引发的**二级事件**可能间接触发：
+
+```
+用户 A 对问题投 UP
+  → sendEvent(EventQuestionVote)
+    → eventqueue → BadgeEventService
+      → 若命中 ReachQuestionVote 徽章 → Award → noticequeue(Achievement)
+        → noticequeue(内部): AddNotification (不触发邮件)
+        → 不发 ExternalNotificationMsg（徽章没有外部通知模板）
+```
+
+**结论**：投票链路在当前代码中**完全不触发外部邮件通知**。外部邮件仅在新问题/新回答/新评论/邀请回答四种场景触发。
+
+---
+
+## 二十一、日志埋点与队列监控的单测覆盖盲点
+
+### 21.1 投票链路的日志埋点现状
+
+| 层级 | 文件 | 日志级别 | 触发场景 | 日志内容 |
+|------|------|----------|----------|----------|
+| VoteRepo | [vote_repo.go](file:///d:/fz/0601-1/solo-dogfeeding/code/63-answer/internal/repo/activity/vote_repo.go) | `log.Error` | acquireUserInfo 查询失败 | 原始 error |
+| VoteRepo | vote_repo.go | `log.Error` | setActivityRankToZero 读取用户信息失败 | 原始 error |
+| VoteRepo | vote_repo.go | `log.Error` | saveActivitiesAvailable 更新失败 | 原始 error |
+| VoteRepo | vote_repo.go | `log.Error` | cancelActivities 已取消 Activity 更新失败 | activity.ID + "not exist" |
+| VoteRepo | vote_repo.go | `log.Error` | changeUserRank/rollbackUserRank 失败 | 原始 error |
+| VoteRepo | vote_repo.go | `log.Errorf` | countVoteUp/Down 查询失败 | "get vote up/down count error" |
+| VoteRepo | vote_repo.go | `log.Error` | updateVotes 更新 vote_count 失败 | 原始 error |
+| VoteService | [vote_service.go](file:///d:/fz/0601-1/solo-dogfeeding/code/63-answer/internal/service/content/vote_service.go) | `log.Error` | sendEvent 失败 | 原始 error |
+| VoteService | vote_service.go | `log.Error` | GetAndSaveVoteResult 失败 | 原始 error |
+| VoteService | vote_service.go | `log.Warnf` | getActivities 配置读取失败 | "get config by key error" |
+
+**日志缺失的场景**：
+| 缺失场景 | 影响 |
+|----------|------|
+| 投票成功无 Info 日志 | 无法通过日志统计投票 QPS/延迟 |
+| 去重命中（votePreCheck 返回 noNeedToVote）无日志 | 无法判断去重拦截频率 |
+| 每日上限触发（Rank=0）无日志 | 无法监控上限命中的用户和时间 |
+| vote_count 重算值与旧值差异大无日志 | 无法发现计數漂移 |
+| 事务耗时无日志 | 无法定位慢投票事务 |
+| 队列 Send 阻塞无日志 | 无法发现队列背压 |
+
+### 21.2 队列深度 Metric 的完全缺失
+
+系统中**没有任何 metric 埋点**。搜索整个 `internal` 目录，未找到 `prometheus`、`histogram`、`counter`、`metric` 相关代码。
+
+**缺失的队列 metric**：
+
+| Metric | 作用 | 当前状态 |
+|--------|------|----------|
+| `queue_depth{queue="eventqueue"}` | 监控队列积压深度 | ❌ 无 |
+| `queue_latency{queue="eventqueue"}` | 消息从入队到消费的延迟 | ❌ 无 |
+| `queue_handler_duration{queue="noticequeue"}` | Handler 执行耗时 | ❌ 无 |
+| `queue_handler_error_total{queue="eventqueue"}` | Handler 失败计数 | ❌ 无 |
+| `queue_send_blocked_total{queue="*"}` | Send 阻塞次数 | ❌ 无 |
+| `vote_transaction_duration` | 投票事务耗时 | ❌ 无 |
+| `rank_change_total{direction="up/down"}` | 声望增减计数 | ❌ 无 |
+
+**影响**：
+- 队列积压时无法告警（只能靠用户投诉"没收到徽章"才发现）
+- 投票事务变慢时无法定位（无 P99 延迟监控）
+- 声望异常增长时无法检测（无增量监控）
+
+### 21.3 单测覆盖盲点
+
+项目中与投票/队列相关的单测文件：
+
+| 测试文件 | 覆盖范围 | 缺失场景 |
+|----------|----------|----------|
+| [queue_test.go](file:///d:/fz/0601-1/solo-dogfeeding/code/63-answer/internal/base/queue/queue_test.go) | 队列基础操作：发送/接收/多消息/并发/Close 竞态 | 见下表 |
+
+**queue_test.go 覆盖的场景**：
+- ✅ 单条消息发送接收
+- ✅ 100 条消息顺序消费
+- ✅ 无 Handler 时消息丢弃
+- ✅ 先 Send 后 RegisterHandler
+- ✅ Close 后所有消息处理完毕
+- ✅ 10 goroutine 并发 Send
+- ✅ 并发 RegisterHandler 竞态
+- ✅ Send/Close 并发竞态（100 次迭代）
+
+**queue_test.go 缺失的场景**：
+| 缺失测试 | 风险 |
+|----------|------|
+| Handler 返回 error 的路径 | 验证 error 仅 log 不重入队列 |
+| channel 满时 Send 阻塞行为 | 验证背压和 ctx 取消 |
+| ctx 取消后 Send 返回行为 | 验证不阻塞已取消的请求 |
+| Close 后 Send 行为 | 验证不 panic（当前测试只验证了不 panic 但没断言返回值） |
+| 消息处理顺序保证 | 验证 FIFO 严格性（当前只验证了计数） |
+
+**完全缺失的投票层单测**：
+
+| 缺失的测试模块 | 应覆盖场景 |
+|----------------|-----------|
+| vote_repo_test | 去重两层（votePreCheck + saveActivitiesAvailable）、并发投票竞争、每日上限触发、声望下界保护 |
+| vote_service_test | 互斥取消（Cancel down + Vote up）编排、sendEvent 仅正向投票触发 |
+| cancel_vote_test | CancelVote 幂等性、已取消记录二次取消 Rank=0、声望回滚正确性 |
+| rank_change_test | ChangeUserRank 原子 INCR、负数扣减到 1 截断、RankAgent 开关跳过 |
+| badge_event_test | EventRuleMapping 规则匹配、CheckIsAward 去重、Award 失败不中断其他 |
+| notification_test | Achievement 去重更新 rank、Inbox 不去重、红点计数 |
+
+### 21.4 盲点的风险总结
+
+| 维度 | 当前状态 | 最坏风险 | 建议优先级 |
+|------|----------|----------|------------|
+| 日志埋点 | 仅 Error 级别，无业务指标 | 投票失败只能靠用户投诉发现 | P1 - 补充 Info/Warn 日志 |
+| 队列 Metric | 完全缺失 | 队列积压无告警，徽章延迟无感知 | P1 - 至少补 queue_depth |
+| 投票单测 | 完全缺失 | 去重/取消/声望保护逻辑无回归保障 | P1 - 补 vote_repo_test |
+| 队列单测 | 基础覆盖 | Handler error 路径未验证 | P2 - 补 error 路径测试 |
+| 邮件重试 | 无重试 | SMTP 临时故障导致邮件永久丢失 | P2 - 至少加 1 次重试 |
