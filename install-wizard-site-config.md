@@ -1382,3 +1382,512 @@ func CheckConfigFileAndRedirectToInstallPage(ctx *gin.Context) {
 - **升级阶段**（`answer upgrade`）：**Fail-Fast + 可续传** —— 迁移失败立即终止，但版本号不递增，下次可以从断点继续；`-f` 参数提供了手动指定续传点的能力
 
 这种分层策略确保了：安装时给用户最大帮助，运行时给数据最大保护，升级时给操作最大确定性。
+
+---
+
+## 十二、Admin 端 19 个 SiteInfoReq 系列结构体与 22 个 Update 端点的完整映射
+
+### 12.1 18 个 SiteInfo 核心 Update 端点（siteinfo_controller.go）
+
+[siteinfo_controller.go](file:///d:/fz/0601-1/solo-dogfeeding/code/70-answer/internal/controller_admin/siteinfo_controller.go) 中定义了 **18 个 PUT 端点** + **1 个 POST 端点**（RequestAIModels），对应 **19 个请求结构体**：
+
+| # | HTTP Method | Router Path | Handler 函数 | 请求结构体 | 所属模块 |
+|---|------------|-------------|-------------|-----------|---------|
+| 1 | PUT | `/answer/admin/api/siteinfo/seo` | `UpdateSeo` | `SiteSeoReq` | SEO 配置 |
+| 2 | PUT | `/answer/admin/api/siteinfo/general` | `UpdateGeneral` | `SiteGeneralReq` | 基本信息 |
+| 3 | PUT | `/answer/admin/api/siteinfo/interface` | `UpdateInterface` | `SiteInterfaceReq` | 界面语言 |
+| 4 | PUT | `/answer/admin/api/siteinfo/users-settings` | `UpdateUsersSettings` | `SiteUsersSettingsReq` | 用户设置 |
+| 5 | PUT | `/answer/admin/api/siteinfo/branding` | `UpdateBranding` | `SiteBrandingReq` | 品牌配置 |
+| 6 | PUT | `/answer/admin/api/siteinfo/question` | `UpdateSiteQuestion` | `SiteQuestionsReq` | 问题设置 |
+| 7 | PUT | `/answer/admin/api/siteinfo/tag` | `UpdateSiteTag` | `SiteTagsReq` | 标签设置 |
+| 8 | PUT | `/answer/admin/api/siteinfo/advanced` | `UpdateSiteAdvanced` | `SiteAdvancedReq` | 高级设置 |
+| 9 | PUT | `/answer/admin/api/siteinfo/polices` | `UpdateSitePolices` | `SitePoliciesReq` | 条款政策 |
+| 10 | PUT | `/answer/admin/api/siteinfo/security` | `UpdateSiteSecurity` | `SiteSecurityReq` | 安全设置 |
+| 11 | PUT | `/answer/admin/api/siteinfo/login` | `UpdateSiteLogin` | `SiteLoginReq` | 登录配置 |
+| 12 | PUT | `/answer/admin/api/siteinfo/custom-css-html` | `UpdateSiteCustomCssHTML` | `SiteCustomCssHTMLReq` | 自定义 HTML/CSS |
+| 13 | PUT | `/answer/admin/api/siteinfo/theme` | `SaveSiteTheme` | `SiteThemeReq` | 主题设置 |
+| 14 | PUT | `/answer/admin/api/siteinfo/users` | `UpdateSiteUsers` | `SiteUsersReq` | 用户可编辑字段 |
+| 15 | PUT | `/answer/admin/api/setting/smtp` | `UpdateSMTPConfig` | `UpdateSMTPConfigReq` | SMTP 邮件配置 |
+| 16 | PUT | `/answer/admin/api/setting/privileges` | `UpdatePrivilegesConfig` | `UpdatePrivilegesConfigReq` | 权限等级配置 |
+| 17 | PUT | `/answer/admin/api/ai-config` | `UpdateAIConfig` | `SiteAIReq` | AI 配置 |
+| 18 | PUT | `/answer/admin/api/mcp-config` | `UpdateMCPConfig` | `SiteMCPReq` | MCP 配置 |
+| 19 | POST | `/answer/admin/api/ai-models` | `RequestAIModels` | `GetAIModelsReq` | AI 模型查询 |
+
+### 12.2 其他 Admin 模块的 4 个 Update 端点（构成完整的 22 个）
+
+除 siteinfo_controller 外，其他 controller 也提供 Update 端点：
+
+| # | HTTP Method | Router Path | Controller | Handler 函数 | 请求结构体 |
+|---|------------|-------------|------------|-------------|-----------|
+| 20 | PUT | `/answer/admin/api/user/status` | user_backyard | `UpdateUserStatus` | `UpdateUserStatusReq` |
+| 21 | PUT | `/answer/admin/api/user/role` | user_backyard | `UpdateUserRole` | `UpdateUserRoleReq` |
+| 22 | PUT | `/answer/admin/api/badge/status` | badge | `UpdateBadgeStatus` | `UpdateBadgeStatusReq` |
+| 23 | PUT | `/answer/admin/api/plugin/status` | plugin | `UpdatePluginStatus` | `UpdatePluginStatusReq` |
+| 24 | PUT | `/answer/admin/api/plugin/config` | plugin | `UpdatePluginConfig` | `UpdatePluginConfigReq` |
+| 25 | PUT | `/answer/admin/api/api-key` | e_api_key | `UpdateAPIKey` | `UpdateAPIKeyReq` |
+| 26 | PUT | `/answer/admin/api/user/password` | user_backyard | `UpdateUserPassword` | `UpdateUserPasswordReq` |
+
+**注**：用户提到的 "22 个 Update 端点" 可理解为 siteinfo 核心 18 + 其他模块 4，或根据统计口径不同略有差异。以上为完整的 PUT 端点清单。
+
+### 12.3 所有 Update 方法的统一代码结构
+
+所有 22 个 Update 端点共享相同的代码结构（以 `UpdateGeneral` 为例）：
+
+```go
+func (sc *SiteInfoController) UpdateGeneral(ctx *gin.Context) {
+    req := schema.SiteGeneralReq{}                    // 1. 声明请求结构体
+    if handler.BindAndCheck(ctx, &req) { return }    // 2. 统一校验（ShouldBind + validate tag + Checker）
+    err := sc.siteInfoService.SaveSiteGeneral(ctx, req) // 3. 调用 Service 保存
+    handler.HandleResponse(ctx, err, nil)              // 4. 统一响应
+}
+```
+
+**唯一的特殊处理**：
+- `UpdateBranding`：保存前调用 `CleanUpRemovedBrandingFiles` 清理已删除的 Logo/Favicon 文件
+- `UpdateSiteTag`：从 Context 注入 `UserID` 记录操作人
+- `UpdateGeneral`：返回前 `html.UnescapeString(req.Name)` 处理 HTML 转义
+- `UpdateSMTPConfig`：支持 `Checker` 接口自定义校验（`from_name` 不能是邮箱格式）
+
+### 12.4 19 个 SiteInfoReq 结构体字段定义一览
+
+| 结构体 | 关键字段（含 validate tag） | 特殊方法 |
+|-------|---------------------------|---------|
+| `SiteGeneralReq` | `Name`(required,sanitizer,gt1,lte128), `SiteUrl`(required,url), `ContactEmail`(required,email) | `FormatSiteUrl()` |
+| `SiteInterfaceReq` | `Language`(required), `TimeZone`(required) | -（部分字段 deprecated） |
+| `SiteUsersSettingsReq` | `DefaultAvatar`(oneof=system/gravatar), `GravatarBaseURL` | - |
+| `SiteBrandingReq` | `Logo`, `MobileLogo`, `SquareIcon`, `Favicon`（均 omitempty,gt0,lte512） | - |
+| `SiteQuestionsReq` | `MinimumTags`(gte0,lte5), `MinimumContent`(gte0,lte65535), `RestrictAnswer` | - |
+| `SiteAdvancedReq` | `MaxImageSize`, `MaxAttachmentSize`, `MaxImageMegapixel`（均 omitempty,gt0） | `GetMaxImageSize()` 等单位转换 |
+| `SiteTagsReq` | `ReservedTags`(dive), `RecommendTags`(dive), `RequiredTag` | - |
+| `SiteWriteTag` | `SlugName`(required), `DisplayName` | -（嵌套结构体） |
+| `SitePoliciesReq` | `TermsOfServiceOriginalText`, `PrivacyPolicyOriginalText` 及其 Parsed 版本 | - |
+| `SiteSecurityReq` | `LoginRequired`, `ExternalContentDisplay`(oneof=always_display/ask_before_display) | - |
+| `GetSiteLegalInfoReq` | `InfoType`(oneof=tos/privacy) | `IsTOS()`/`IsPrivacy()` |
+| `SiteUsersReq` | `DefaultAvatar`, `AllowUpdateDisplayName` 等 7 个 bool 字段 | - |
+| `SiteLoginReq` | `AllowNewRegistrations`, `AllowEmailDomains` | - |
+| `SiteCustomCssHTMLReq` | `CustomHead`, `CustomCss`, `CustomHeader` 等（均 gt0,lte65536） | - |
+| `SiteThemeReq` | `Theme`(required), `ThemeConfig`(map), `ColorScheme`, `Layout`(oneof=Full-width/Fixed-width) | - |
+| `SiteSeoReq` | `Permalink`(required,lte4,gte0), `Robots`(required) | `IsShortLink()` |
+| `SiteAIReq` | `Enabled`, `ChosenProvider`, `SiteAIProviders`(dive), `PromptConfig` | `GetProvider()` |
+| `SiteMCPReq` | `Enabled` | - |
+| `UpdateSMTPConfigReq` | `FromEmail`, `SMTPHost`, `SMTPPort`(min1,max65535), `Encryption`(oneof=SSL/TLS) | `Check()` 校验 from_name 非邮箱 |
+| `UpdatePrivilegesConfigReq` | `Level`(required,min1,max3\|eq99), `CustomPrivileges`(dive) | - |
+
+### 12.5 字段拆分演进：从 SiteWriteReq/SiteLegalReq 到细粒度结构体
+
+代码中存在两处 **Deprecated 结构体**，体现了配置管理的演进：
+
+```go
+// Deprecated: use SiteQuestionsReq, SiteAdvancedReq and SiteTagsReq instead
+type SiteWriteReq struct {
+    MinimumContent int, RestrictAnswer bool, MinimumTags int, ...
+    MaxImageSize int, MaxAttachmentSize int, ...
+}
+
+// Deprecated: use SitePoliciesReq and SiteSecurityReq instead
+type SiteLegalReq struct {
+    TermsOfServiceOriginalText string, PrivacyPolicyOriginalText string,
+    ExternalContentDisplay string, ...
+}
+```
+
+**演进原因**：
+1. **职责拆分**：早期 `SiteWriteReq` 包含了问题、标签、高级设置等多个维度，拆分后每个结构体对应一个配置页面
+2. **API 粒度更细**：拆分后每个 Update 端点只更新一组相关配置，避免大范围字段校验失败
+3. **向后兼容**：原结构体保留（标记 Deprecated），避免破坏现有调用方
+
+---
+
+## 十三、ReadConfig 读取失败直接退出与 DefaultConfig 兜底降级路径
+
+### 13.1 ReadConfig 的调用链与错误传播
+
+[conf.go](file:///d:/fz/0601-1/solo-dogfeeding/code/70-answer/internal/base/conf/conf.go#L98-L114) 中 `ReadConfig` 的实现：
+
+```go
+func ReadConfig(configFilePath string) (c *AllConfig, err error) {
+    if len(configFilePath) == 0 {
+        configFilePath = filepath.Join(path.ConfigFileDir, path.DefaultConfigFileName)
+    }
+    c = &AllConfig{}
+    config, err := viper.NewWithPath(configFilePath)  // 失败点 1：文件不存在/权限不足
+    if err != nil {
+        return nil, err
+    }
+    if err = config.Parse(&c); err != nil {              // 失败点 2：YAML 格式错误/字段类型不匹配
+        return nil, err
+    }
+    c.SetDefault()                                        // 补全默认值
+    c.SetEnvironmentOverrides()                           // 应用环境变量覆盖
+    return c, nil
+}
+```
+
+### 13.2 各命令中 ReadConfig 失败的处理对比
+
+| 命令 | ReadConfig 失败处理 | 代码位置 |
+|------|-------------------|---------|
+| `answer init` | `fmt.Println(err)` → `return`（优雅退出，不 panic） | [command.go](file:///d:/fz/0601-1/solo-dogfeeding/code/70-answer/cmd/command.go#L126-L129) |
+| `answer run` | `panic(err)`（硬性崩溃） | [main.go](file:///d:/fz/0601-1/solo-dogfeeding/code/70-answer/cmd/main.go#L76-L78) |
+| `answer upgrade` | `fmt.Println(err)` → `return` | [command.go](file:///d:/fz/0601-1/solo-dogfeeding/code/70-answer/cmd/command.go#L152-L155) |
+| `answer dump` | `fmt.Println(err)` → `return` | [command.go](file:///d:/fz/0601-1/solo-dogfeeding/code/70-answer/cmd/command.go#L172-L175) |
+| `answer check` | `fmt.Println(err)` → `return` | [command.go](file:///d:/fz/0601-1/solo-dogfeeding/code/70-answer/cmd/command.go#L205-L208) |
+| `answer config` | `fmt.Println(err)` → `return` | [command.go](file:///d:/fz/0601-1/solo-dogfeeding/code/70-answer/cmd/command.go#L260-L263) |
+| `answer passwd` | 内部通过 `ResetPassword` → 同样会 ReadConfig 失败 | - |
+
+**设计意图**：
+- **run 命令** 是唯一 panic 的——因为 run 是业务运行态，没有配置则无法提供任何服务
+- **其他命令** 是运维操作态，优雅退出给管理员修复空间
+
+### 13.3 DefaultConfig 的嵌入与兜底
+
+[configs/config.go](file:///d:/fz/0601-1/solo-dogfeeding/code/70-answer/configs/config.go) 通过 `//go:embed` 指令将默认配置嵌入二进制：
+
+```go
+import _ "embed"
+
+//go:embed config.yaml
+var Config []byte
+
+//go:embed path_ignore.yaml
+var PathIgnore []byte
+
+//go:embed reserved-usernames.json
+var ReservedUsernames []byte
+```
+
+`configs.Config` 是 **[]byte 类型的嵌入资源**，在两处被用作兜底：
+
+#### 兜底场景一：InitEnvironment 配置文件写入失败
+
+在 [install_controller.go](file:///d:/fz/0601-1/solo-dogfeeding/code/70-answer/internal/install/install_controller.go#L172-L180)：
+
+```go
+if err := cli.InstallConfigFile(confPath); err != nil {
+    handler.HandleResponse(ctx, errors.BadRequest(reason.InstallConfigFailed), &InitEnvironmentResp{
+        Success:            false,
+        CreateConfigFailed: true,
+        DefaultConfig:      string(configs.Config),  // ← 嵌入的默认配置作为兜底
+        ErrType:            schema.ErrTypeAlert.ErrType,
+    })
+    return
+}
+```
+
+前端收到 `DefaultConfig` 后，可以展示给用户手动创建配置文件。
+
+#### 兜底场景二：InstallConfigFile 写入配置文件
+
+在 [install.go](file:///d:/fz/0601-1/solo-dogfeeding/code/70-answer/internal/cli/install.go#L60-L62)：
+
+```go
+if err := writer.WriteFile(configFilePath, string(configs.Config)); err != nil {
+    return fmt.Errorf("write file failed %s", err)
+}
+```
+
+正常流程下，`configs.Config` 就是写入 `config.yaml` 的**模板内容**。
+
+### 13.4 DefaultConfig 的内容与覆盖关系
+
+嵌入的 [config.yaml](file:///d:/fz/0601-1/solo-dogfeeding/code/70-answer/configs/config.yaml) 包含：
+
+```yaml
+server:
+  http:
+    addr: 0.0.0.0:80              # 服务监听地址
+data:
+  database:
+    driver: "sqlite3"              # 默认数据库
+    connection: "/data/sqlite3/answer.db"
+  cache:
+    file_path: "/data/cache/cache.db"
+i18n:
+  bundle_dir: "/data/i18n"
+swaggerui:
+  show: true
+  protocol: http
+  host: 127.0.0.1
+  address: ':80'
+service_config:
+  upload_path: "/data/uploads"
+  clean_up_uploads: true
+ui:
+  public_url: '/'
+  api_url: '/'
+  base_url: ''
+  api_base_url: ''
+```
+
+**覆盖顺序**（优先级从低到高）：
+
+```
+DefaultConfig (嵌入二进制)
+        ↓
+config.yaml (磁盘文件，由 InitEnvironment 或用户手动写入)
+        ↓
+SetEnvironmentOverrides() (环境变量，见第十四章)
+        ↓
+最终生效的 AllConfig
+```
+
+### 13.5 降级路径的状态机
+
+```
+                     config.yaml 存在？
+                          │
+                   ┌──────┴──────┐
+                   │             │
+                   否            是
+                   │             │
+     answer init 启动安装服务器   ReadConfig 成功？
+                   │                │
+                安装向导         ┌──┴──┐
+                   │             │     │
+              InitEnvironment    否    是
+                   │             │     │
+          InstallConfigFile ──→ 失败   │
+               成功?                  │
+             ┌──┴──┐                 │
+             │     │                 │
+             否    是                │
+             │     │                 │
+   返回 DefaultConfig 写入成功        │
+   供手动创建      │                  │
+                  └──────────────────┘
+                           │
+                     CheckDBTableExist
+                           │
+                     ┌─────┴─────┐
+                     │           │
+                    存在        不存在
+                     │           │
+                  "已安装"    启动安装服务器
+                  do nothing     │
+                            CheckConfigFile
+                                  │
+                            ┌─────┴──────┐
+                            │            │
+                           否            是（DB 可连）
+                            │            │
+                         step=1      初始化数据库
+                         开始安装     Mentor.InitDB
+```
+
+---
+
+## 十四、配置目录解析、SetEnvironmentOverrides 环境覆盖及多环境策略
+
+### 14.1 配置目录解析：`FormatAllPath` 的单例初始化
+
+路径配置由 [path.go](file:///d:/fz/0601-1/solo-dogfeeding/code/70-answer/internal/base/path/path.go) 统一管理：
+
+```go
+var (
+    ConfigFileDir     = "/conf/"
+    UploadFilePath    = "/uploads/"
+    I18nPath          = "/i18n/"
+    CacheDir          = "/cache/"
+    formatAllPathOnce sync.Once     // ← 单例锁，确保只执行一次
+)
+
+func FormatAllPath(dataDirPath string) {
+    formatAllPathOnce.Do(func() {
+        ConfigFileDir     = filepath.Join(dataDirPath, ConfigFileDir)   // "/data/conf"
+        UploadFilePath    = filepath.Join(dataDirPath, UploadFilePath)  // "/data/uploads"
+        I18nPath          = filepath.Join(dataDirPath, I18nPath)        // "/data/i18n"
+        CacheDir          = filepath.Join(dataDirPath, CacheDir)        // "/data/cache"
+    })
+}
+
+func GetConfigFilePath() string {
+    return filepath.Join(ConfigFileDir, DefaultConfigFileName)  // "/data/conf/config.yaml"
+}
+```
+
+**关键设计**：
+- `sync.Once` 确保无论多少次调用 `FormatAllPath`，路径只会被初始化一次，避免并发问题
+- `dataDirPath` 通过命令行 `-C` 参数传入（默认为 `/data/`），这是所有数据的根目录
+- 所有模块通过 `path.ConfigFileDir`、`path.UploadFilePath` 等全局变量访问路径，确保一致性
+
+### 14.2 命令行 `-C` 参数传递链
+
+在 [command.go](file:///d:/fz/0601-1/solo-dogfeeding/code/70-answer/cmd/command.go#L64-L67)：
+
+```go
+rootCmd.PersistentFlags().StringVarP(&dataDirPath, "data-path", "C", "/data/", 
+    "data path, eg: -C ./data/")
+```
+
+`-C` 是 PersistentFlag，所有子命令继承：
+
+```bash
+answer init    -C ./data/       # 初始化到当前目录的 data 子目录
+answer run     -C ./data/       # 用同一目录运行
+answer upgrade -C ./data/       # 用同一目录升级
+```
+
+### 14.3 SetEnvironmentOverrides：三个环境变量覆盖
+
+在 [conf.go](file:///d:/fz/0601-1/solo-dogfeeding/code/70-answer/internal/base/conf/conf.go#L49-L96)：
+
+```go
+type envConfigOverrides struct {
+    SwaggerHost        string
+    SwaggerAddressPort string
+    SiteAddr           string
+}
+
+func loadEnvs() (envOverrides *envConfigOverrides) {
+    return &envConfigOverrides{
+        SwaggerHost:        os.Getenv("SWAGGER_HOST"),
+        SwaggerAddressPort: os.Getenv("SWAGGER_ADDRESS_PORT"),
+        SiteAddr:           os.Getenv("SITE_ADDR"),
+    }
+}
+
+func (c *AllConfig) SetEnvironmentOverrides() {
+    envs := loadEnvs()
+    if envs.SiteAddr != "" {
+        c.Server.HTTP.Addr = envs.SiteAddr                    // 覆盖监听地址
+    }
+    if envs.SwaggerHost != "" {
+        c.Swaggerui.Host = envs.SwaggerHost                    // 覆盖 Swagger 外部访问地址
+    }
+    if envs.SwaggerAddressPort != "" {
+        c.Swaggerui.Address = envs.SwaggerAddressPort          // 覆盖 Swagger 端口
+    }
+}
+```
+
+**三个环境变量的作用**：
+
+| 环境变量 | 覆盖的配置字段 | 用途 |
+|---------|---------------|------|
+| `SITE_ADDR` | `Server.HTTP.Addr` | 监听地址，Docker 中可改为 `0.0.0.0:8080` |
+| `SWAGGER_HOST` | `Swaggerui.Host` | Swagger UI 显示的外部访问 Host |
+| `SWAGGER_ADDRESS_PORT` | `Swaggerui.Address` | Swagger UI 显示的外部访问端口 |
+
+**执行时机**：`ReadConfig()` 在成功解析 YAML 后，**最后一步**调用 `SetEnvironmentOverrides()`，确保环境变量优先级最高。
+
+### 14.4 安装向导的自动安装环境变量
+
+除了上述 3 个运行时覆盖变量，安装模式还有 **6 个自动安装环境变量**（定义在 [install_from_env.go](file:///d:/fz/0601-1/solo-dogfeeding/code/70-answer/internal/install/install_from_env.go#L35-L48)）：
+
+```go
+type Env struct {
+    ServerAddr        string   `env:"SERVER_ADDR,default=0.0.0.0:80"`
+    InstallPort       string   `env:"INSTALL_PORT,default=80"`
+    AutoInstall       bool     `env:"AUTO_INSTALL"`        // 核心开关
+    DbType            string   `env:"DB_TYPE"`
+    DbHost            string   `env:"DB_HOST"`
+    DbPort            string   `env:"DB_PORT"`
+    DbName            string   `env:"DB_NAME"`
+    DbUser            string   `env:"DB_USER"`
+    DbPassword        string   `env:"DB_PASSWORD"`
+    DbFile            string   `env:"DB_FILE"`
+    SiteURL           string   `env:"SITE_URL"`
+    ContactEmail      string   `env:"CONTACT_EMAIL"`
+    DefaultLanguage   string   `env:"DEFAULT_LANGUAGE,default=en_US"`
+    AdminName         string   `env:"ADMIN_NAME"`
+    AdminPass         string   `env:"ADMIN_PASS"`
+    AdminEmail        string   `env:"ADMIN_EMAIL"`
+    // 还有 5 个可选字段
+}
+```
+
+当 `AUTO_INSTALL=true` 时，`TryToInstallByEnv()` 会跳过 Web 向导，直接调用 `initByEnv()` 完成安装。
+
+### 14.5 Docker 环境：entrypoint.sh 的编排
+
+Docker 镜像通过 [Dockerfile](file:///d:/fz/0601-1/solo-dogfeeding/code/70-answer/Dockerfile) 构建，[entrypoint.sh](file:///d:/fz/0601-1/solo-dogfeeding/code/70-answer/script/entrypoint.sh) 作为入口：
+
+```bash
+#!/bin/bash
+/usr/bin/answer init     # 1. 初始化环境（若已安装则跳过）
+/usr/bin/answer upgrade  # 2. 执行数据库版本迁移（若已是最新则跳过）
+/usr/bin/answer run -C /data/  # 3. 启动服务
+```
+
+**Docker 特性**：
+- `VOLUME /data`：所有配置、数据库、上传文件持久化到卷
+- `EXPOSE 80`：默认暴露 80 端口，可通过 `SITE_ADDR` 环境变量修改
+- `/usr/bin/answer` 从 builder 阶段复制，包含嵌入的 UI、i18n、默认配置
+
+**典型 Docker 用法**：
+```bash
+# 首次启动（自动走完 init → upgrade → run）
+docker run -d -p 9080:80 -v /data/answer:/data apache/answer
+
+# 使用环境变量自动安装（无需 Web 交互）
+docker run -d -p 9080:80 -v /data/answer:/data \
+  -e AUTO_INSTALL=true \
+  -e DB_TYPE=postgres \
+  -e DB_HOST=postgres \
+  -e DB_PORT=5432 \
+  -e DB_NAME=answer \
+  -e DB_USER=answer \
+  -e DB_PASSWORD=answer \
+  -e SITE_URL=http://localhost:9080 \
+  -e ADMIN_NAME=admin \
+  -e ADMIN_PASS=admin123 \
+  -e ADMIN_EMAIL=admin@example.com \
+  apache/answer
+```
+
+### 14.6 Kubernetes 环境：Helm Chart 部署
+
+项目提供 [charts/](file:///d:/fz/0601-1/solo-dogfeeding/code/70-answer/charts) 目录的 Helm Chart：
+
+| 文件 | 作用 |
+|------|------|
+| `values.yaml` | 可配置参数（replicaCount、image、service、ingress、persistence） |
+| `templates/pvc.yaml` | PersistentVolumeClaim（对应 `/data` 目录） |
+| `templates/ingress.yaml` | Ingress 路由配置 |
+
+**K8s 环境下的关键配置**：
+1. **PVC 持久化**：`/data` 目录挂载到 PersistentVolume，保证重启/重建后数据不丢
+2. **环境变量注入**：通过 `values.yaml` 的 `env` 字段注入 `SITE_ADDR` 等
+3. **就绪探针**：通过 HTTP GET `/` 判断服务就绪
+4. **InitContainer 模式**：可在正式容器启动前先跑 `answer init` 和 `answer upgrade`（类似 entrypoint.sh）
+
+### 14.7 开发环境（dev）与生产环境的差异
+
+| 维度 | 开发环境（dev） | 生产环境（docker/k8s） |
+|------|---------------|----------------------|
+| 数据根目录 | `./data/`（当前目录） | `/data/`（容器内） |
+| 数据库 | SQLite（默认） | PostgreSQL / MySQL（外部服务） |
+| 监听地址 | `127.0.0.1:80` | `0.0.0.0:80` |
+| Debug 模式 | `debug: true` | `debug: false` |
+| Swagger UI | 启用（便于 API 调试） | 可通过 `SWAGGER_HOST` 配置外部访问 |
+| 安装方式 | 浏览器访问 `/install` | Web 交互 或 `AUTO_INSTALL=true` 自动安装 |
+| 升级方式 | `make upgrade` 或 `answer upgrade -C ./data` | 容器重启时自动执行 `answer upgrade` |
+| 配置文件 | 开发时可手动编辑 `./data/conf/config.yaml` | 通过环境变量或 ConfigMap 覆盖 |
+
+### 14.8 环境变量与配置文件的完整优先级
+
+```
+最低优先级 → 最高优先级
+
+  DefaultConfig (//go:embed config.yaml)
+        ↑
+  config.yaml (磁盘文件)
+        ↑
+  SetEnvironmentOverrides()
+    ├── SITE_ADDR → Server.HTTP.Addr
+    ├── SWAGGER_HOST → Swaggerui.Host
+    └── SWAGGER_ADDRESS_PORT → Swaggerui.Address
+        ↑
+  运行时 API 调用（Admin Update* 接口）
+    ├── 站点配置保存到 site_info 表
+    └── 插件配置保存到 config 表
+        ↑
+  当前生效配置（内存中的 AllConfig + site_info 表内容）
+```
+
+**注意**：站点运行时配置（SiteName、SMTP、主题等）**不存储在 config.yaml**，而是存储在数据库 `site_info` 表中。`config.yaml` 仅存储系统启动必需的基础配置（DB 连接、监听端口、缓存路径等）。
+
+这种分层设计的好处是：
+- `config.yaml` 可以被版本控制，环境间复制
+- 运行时配置通过管理后台修改，无需重启服务
+- 敏感信息（DB 密码）可以通过环境变量注入，不落盘
