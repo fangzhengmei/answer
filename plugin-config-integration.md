@@ -446,29 +446,54 @@ type UserCenter interface {
 - 如果 `UserRoleAgentEnabled=true`，管理后台禁用修改用户角色
 - 如果 `EnabledOriginalUserSystem=false`，管理后台禁用创建用户和修改密码
 
-### 4.3 UserCenter 的"互斥"真相（重要纠正）
+### 4.3 UserCenter 的选择顺序：CallUserCenter 与 GetUserCenter 的真实行为
 
-**之前文档中的错误**：将 UserCenter 描述为"只能启用一个（互斥）"。
+**代码事实**：UserCenter **没有** coordinated 互斥函数，`statusManager.Enable` [plugin.go#L186-L202](file:///d:/fz/0601-1/solo-dogfeeding/code/68-answer/plugin/plugin.go#L186-L202) 中只处理 Captcha 和 CDN。但 UserCenter 的选择行为需要区分 `CallUserCenter`（泛型 Stack 遍历）和 `GetUserCenter`（便捷封装）两个层面。
 
-**代码事实**：
+**CallUserCenter 的遍历机制**：
 
-1. `statusManager.Enable` [plugin.go#L186-L202](file:///d:/fz/0601-1/solo-dogfeeding/code/68-answer/plugin/plugin.go#L186-L202) 中只调用了 `coordinatedCaptchaPlugins` 和 `coordinatedCDNPlugins`——**没有** `coordinatedUserCenterPlugins`。
-2. UserCenter 的 MakePlugin 声明为 `MakePlugin[UserCenter](false)` [user_center.go#L101](file:///d:/fz/0601-1/solo-dogfeeding/code/68-answer/plugin/user_center.go#L101)，super=false。
-3. 理论上，管理员可以通过直接修改 `config` 表中的 `plugin.status` JSON，同时启用多个 UserCenter 插件。
+[CallUserCenter](file:///d:/fz/0601-1/solo-dogfeeding/code/68-answer/plugin/user_center.go#L100-L101) 来自 `MakePlugin[UserCenter](false)`，底层就是 [plugin.go#L155-L167](file:///d:/fz/0601-1/solo-dogfeeding/code/68-answer/plugin/plugin.go#L155-L167) 的标准 `call` 闭包：
 
-**为什么实际上仍然只有一个生效？**
+```go
+call := func(fn Caller[T]) error {
+    for _, p := range stack.plugins {
+        if !super && !StatusManager.IsEnabled(p.Info().SlugName) {
+            continue
+        }
+        if err := fn(p); err != nil {
+            return err          // ← 遇到 error 就 break
+        }
+    }
+    return nil
+}
+```
 
-因为所有调用 UserCenter 的便捷函数和 Controller 都只取**遍历顺序的第一个**已启用插件：
+**关键细节**：遍历中如果 `fn(p)` 返回 `error != nil`，循环会**立即终止**。这与 CallCaptcha 的"两次遍历+不 break"完全不同。
 
-- [UserCenterEnabled()](file:///d:/fz/0601-1/solo-dogfeeding/code/68-answer/plugin/user_center.go#L104-L110)：找到第一个就设置 `enabled=true` 返回
-- [RankAgentEnabled()](file:///d:/fz/0601-1/solo-dogfeeding/code/68-answer/plugin/user_center.go#L112-L118)：只取第一个插件的 `RankAgentEnabled`
-- [GetUserCenter()](file:///d:/fz/0601-1/solo-dogfeeding/code/68-answer/plugin/user_center.go#L120-L127)：只返回遍历到的第一个
-- [UserCenterAgent](file:///d:/fz/0601-1/solo-dogfeeding/code/68-answer/internal/controller/plugin_user_center_controller.go#L59-L99)：`CallUserCenter` 遍历中只取第一个的 `Description()`
-- 所有 LoginCallback/SignUpCallback 路由：通过 `GetUserCenter()` 获取实例后调用
+**三个便捷函数的行为差异**：
 
-**结论**：
-- **机制层面**：UserCenter **不是**强制互斥。不存在 coordinated 函数自动禁用同类型其他插件。
-- **使用层面**：所有调用方都只取遍历顺序的第一个已启用的 UserCenter，其余被静默忽略。多个同时启用时非第一个插件不生效也不报错。
+| 函数 | 代码位置 | 闭包返回值 | 遍历行为 | 最终取到哪个 |
+|---|---|---|---|---|
+| `UserCenterEnabled()` | [user_center.go#L104-L110](file:///d:/fz/0601-1/solo-dogfeeding/code/68-answer/plugin/user_center.go#L104-L110) | `return nil`（永远不报错） | 遍历所有已启用 UserCenter，每次都执行 `enabled = true` | 仅判断"有没有"，不区分几个 |
+| `RankAgentEnabled()` | [user_center.go#L112-L118](file:///d:/fz/0601-1/solo-dogfeeding/code/68-answer/plugin/user_center.go#L112-L118) | `return nil`（永远不报错） | 遍历所有已启用 UserCenter，每次覆盖 `enabled` | 取**注册顺序最后一个**已启用的 `RankAgentEnabled` 值 |
+| `GetUserCenter()` | [user_center.go#L120-L127](file:///d:/fz/0601-1/solo-dogfeeding/code/68-answer/plugin/user_center.go#L120-L127) | `return nil`（永远不报错） | 遍历所有已启用 UserCenter，每次覆盖 `uc` | 返回**注册顺序最后一个**已启用的 UserCenter 实例 |
+
+**与 CallCaptcha 的选择对比**：
+
+| 维度 | CallCaptcha | CallUserCenter |
+|---|---|---|
+| 遍历模式 | 两次遍历（第一次选 slugName，第二次精确匹配） | 一次遍历，闭包不 break |
+| 多启用时取哪个 | **注册顺序最后一个**已启用（slugName 覆盖赋值） | **注册顺序最后一个**已启用（uc 覆盖赋值） |
+| 结果是否相同 | 是 | 是 |
+| 互斥保障 | coordinatedCaptchaPlugins（强互斥） | 无 coordinated（弱事实单实例） |
+
+**Controller 层的调用模式**：
+
+- `UserCenterAgent` [L79-L96](file:///d:/fz/0601-1/solo-dogfeeding/code/68-answer/internal/controller/plugin_user_center_controller.go#L79-L96)：直接用 `CallUserCenter`，闭包不 break → 取**注册顺序最后一个**已启用的 `Description()`
+- `UserCenterLoginRedirect` / `UserCenterSignUpRedirect` [L112-L130](file:///d:/fz/0601-1/solo-dogfeeding/code/68-answer/internal/controller/plugin_user_center_controller.go#L112-L130)：直接用 `CallUserCenter`，闭包不 break → 取**注册顺序最后一个**已启用的 `LoginRedirectURL`
+- `UserCenterLoginCallback` / `UserCenterSignUpCallback` [L132-L202](file:///d:/fz/0601-1/solo-dogfeeding/code/68-answer/internal/controller/plugin_user_center_controller.go#L132-L202)：用 `GetUserCenter()` → 返回**注册顺序最后一个**已启用的实例，然后直接调用该实例的 `LoginCallback()`/`SignUpCallback()`
+
+**结论**：UserCenter 和 Captcha 在多启用异常场景下的选择方向一致——都取**注册顺序最后一个**已启用。区别仅在于 Captcha 用两次遍历 + coordinated 强互斥保障，UserCenter 用一次遍历 + 无互斥仅靠覆盖赋值的弱事实单实例。
 
 ### 4.4 用户中心登录回调完整时序
 
@@ -1054,26 +1079,3 @@ Captcha 业务接入采用**双闸门**设计（详见 5.3 节）：第一闸门
 
 前端通过 `check(submitFunc)` 实现**两阶段提交**（详见 5.8 节）：频率未触发时直接执行业务函数；频率触发时弹窗等用户输入后通过 `refCallback` 延迟提交。email 操作因策略为"每次都需要"而自动预加载验证码。`handleCaptchaError` 对首次触发静默弹窗、对输错显示错误信息。`pending` ref 防止并发请求。前端 `captcha.verify` 只是后端闸门一判定结果的 UX 镜像，实际提交时后端会再次跑双闸门校验，双端不互信。
 
-### 7.10 UserCenter 的代理模式
-
-UserCenter 插件采用代理模式：它不替换原有用户体系，而是通过能力声明（`UserCenterDesc`）告诉 Answer 哪些功能由外部用户中心接管。Answer 据此在管理后台禁用相应功能（状态/角色/密码/创建用户），避免操作冲突。同时通过 `EnabledOriginalUserSystem` 控制原系统用户体系的去留。
-
-### 7.11 Captcha 业务集成的"三明治"结构
-
-每个业务接入点都遵循统一的**三明治结构**：
-1. **上层**：Controller 先判断角色（管理员/免链接限制），非管理员才调用 `ActionRecordVerifyCaptcha`
-2. **中层**：CaptchaService 先跑频率策略（ValidationStrategy 闸门一），需要则再验验证码（VerifyCaptcha 闸门二）
-3. **下层**：plugin.Captcha 接口屏蔽具体实现（后端生成 or 第三方服务），CallCaptcha 统一按"注册顺序最后一个已启用"选择
-4. **收尾**：验证通过则 `ActionRecordAdd` 计数 +1，成功完成则 `ActionRecordDel` 清除
-
-### 7.10 UserCenter 的代理模式
-
-UserCenter 插件采用代理模式：它不替换原有用户体系，而是通过能力声明（`UserCenterDesc`）告诉 Answer 哪些功能由外部用户中心接管。Answer 据此在管理后台禁用相应功能（状态/角色/密码/创建用户），避免操作冲突。同时通过 `EnabledOriginalUserSystem` 控制原系统用户体系的去留。
-
-### 7.11 Captcha 业务集成的"三明治"结构
-
-每个业务接入点都遵循统一的**三明治结构**：
-1. **上层**：Controller 先判断角色（管理员/免链接限制），非管理员才调用 `ActionRecordVerifyCaptcha`
-2. **中层**：CaptchaService 先跑频率策略（ValidationStrategy），需要则再验验证码
-3. **下层**：plugin.Captcha 接口屏蔽具体实现（后端生成 or 第三方服务）
-4. **收尾**：验证通过则 `ActionRecordAdd` 计数 +1，成功完成则 `ActionRecordDel` 清除
