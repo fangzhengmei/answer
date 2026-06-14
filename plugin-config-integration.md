@@ -269,19 +269,138 @@ type PluginKVStorage struct {
 
 插件启停状态通过 `config` 表持久化，key 为 `plugin.status`（定义在 [plugin_config_key.go#L23-L24](file:///d:/fz/0601-1/solo-dogfeeding/code/68-answer/internal/base/constant/plugin_config_key.go#L23-L24)），值为 JSON 序列化的 `map[string]bool`。
 
-### 3.6 初始化流程
+### 3.6 插件三阶段初始化：代码串联详解
 
-[PluginCommonService.initPluginData](file:///d:/fz/0601-1/solo-dogfeeding/code/68-answer/internal/service/plugin_common/plugin_common_service.go) 在服务创建时执行，完成以下初始化：
+插件初始化的入口链如下：
 
-1. **KVStorage 初始化**：为所有实现了 `KVStorage` 的插件注入 `KVOperator`（含 DB 和 Cache 实例）
-2. **插件状态恢复**：从 `config` 表读取 `plugin.status`，反序列化到 `StatusManager`
-3. **管理员配置恢复**：从 `plugin_config` 表读取所有插件配置，调用对应插件的 `ConfigReceiver` 在内存中恢复
-4. **Cache 插件注入**：如果存在实现了 `Cache` 的插件，替换全局 Cache 实例
-5. **VectorSearch 同步器注册**：为向量搜索插件注册数据同步器
-6. **UserConfig 读取函数注入**：通过 `RegisterGetPluginUserConfigFunc` 注入数据库读取函数
-7. **用户配置恢复**：后台 goroutine 分页加载 `plugin_user_config`，调用各插件的 `UserConfigReceiver` 恢复用户级配置
+```
+cmd/wire_gen.go →  wire 自动装配
+  └─ plugin_common.NewPluginCommonService(...)      # 构造函数
+       └─ p.initPluginData()                        # 立即执行，同步完成
+```
 
-> 注意：KVStorage（步骤1）发生在状态恢复（步骤2）**之前**，因为 KVStorage 是 super=true，不依赖状态。
+[wire_gen.go#L272](file:///d:/fz/0601-1/solo-dogfeeding/code/68-answer/cmd/wire_gen.go#L272) 在 Wire 依赖注入容器创建 PluginCommonService 时触发其构造函数 [NewPluginCommonService](file:///d:/fz/0601-1/solo-dogfeeding/code/68-answer/internal/service/plugin_common/plugin_common_service.go#L66-L82)，后者在返回前立即调用 `p.initPluginData()`，**阻塞执行**直到基础设施阶段和状态/配置阶段全部完成。
+
+`initPluginData()` [plugin_common_service.go#L143-L230](file:///d:/fz/0601-1/solo-dogfeeding/code/68-answer/internal/service/plugin_common/plugin_common_service.go#L143-L230) 在代码层面自然分为三个连续阶段：
+
+**阶段一：基础设施注入（同步，super=true 扩展点准备）** [L144-L151]
+
+```go
+_ = plugin.CallKVStorage(func(k plugin.KVStorage) error {
+    k.SetOperator(plugin.NewKVOperator(
+        ps.data.DB, ps.data.Cache, k.Info().SlugName,
+    ))
+    return nil
+})
+```
+
+- 调用 `CallKVStorage`（super=true）遍历所有实现 KVStorage 的插件，为每个注入含 DB/Cache/SlugName 的 `KVOperator`。
+- **为什么放在最前面？** 后续两个阶段中插件的 ConfigReceiver/UserConfigReceiver 可能需要访问自己的 KV 数据；若晚于状态恢复，一个被禁用的插件在 UserConfigReceiver（super=false）中会被跳过，但如果它的 KV 还未注入也无所谓。
+- 此阶段没有任何 StatusManager 判断——因为 KVStorage 是 super=true。
+
+**阶段二：状态恢复 + 管理员配置恢复（同步，系统可用的临界点）** [L153-L190]
+
+```go
+// 2a. 从 config 表还原插件启停状态
+pluginStatus, _ := ps.configService.GetStringValueFromDB(
+    context.TODO(), constant.PluginStatus)
+plugin.StatusManager.UnmarshalJSON([]byte(pluginStatus))
+
+// 2b. 从 plugin_config 表还原每个插件的管理员配置
+pluginConfigs, _ := ps.pluginConfigRepo.GetPluginConfigAll(context.Background())
+for _, pluginConfig := range pluginConfigs {
+    plugin.CallConfig(func(fn plugin.Config) error {
+        if fn.Info().SlugName == pluginConfig.PluginSlugName {
+            return fn.ConfigReceiver([]byte(pluginConfig.Value))
+        }
+        return nil
+    })
+}
+
+// 2c. 若有 Cache 插件，替换全局 Cache 实例
+plugin.CallCache(func(cache plugin.Cache) error {
+    ps.data.Cache = cache
+    return nil
+})
+
+// 2d. 为 VectorSearch 插件注册数据同步器
+plugin.CallVectorSearch(func(vs plugin.VectorSearch) error {
+    vs.RegisterSyncer(...)
+    return nil
+})
+```
+
+- 先还原 StatusManager，**再**还原 ConfigReceiver。这个顺序至关重要：`CallConfig` 是 super=true，不受 StatusManager 影响，所以顺序其实不影响 ConfigReceiver 本身；但紧接着 `CallCache`、`CallVectorSearch` 都是 super=false，此时 StatusManager 已就绪，被禁用的插件能被正确跳过。
+- 此阶段完成后，系统对 HTTP 请求已具备基本响应能力（插件启停/配置/缓存均就绪）。
+
+**阶段三：用户配置恢复（异步，后台 goroutine 分页加载）** [L192-L230]
+
+```go
+// 3a. 注入"跨层读取用户配置"函数（plugin 包不直接依赖 repo 层）
+plugin.RegisterGetPluginUserConfigFunc(func(userID, pluginSlugName string) []byte {
+    pluginUserConfig, _, _ := ps.pluginUserConfigRepo.GetPluginUserConfig(
+        context.Background(), userID, pluginSlugName)
+    return []byte(pluginUserConfig.Value)
+})
+
+// 3b. 后台 goroutine 分页加载所有用户配置并回调插件
+go func() {
+    page, pageSize := 1, 1000
+    for {
+        userConfigs, _, _ := ps.pluginUserConfigRepo.GetPluginUserConfigPage(
+            context.Background(), page, pageSize)
+        if len(userConfigs) == 0 { return }
+        for _, userConfig := range userConfigs {
+            plugin.CallUserConfig(func(fn plugin.UserConfig) error {
+                if fn.Info().SlugName == userConfig.PluginSlugName {
+                    return fn.UserConfigReceiver(userConfig.UserID,
+                        []byte(userConfig.Value))
+                }
+                return nil
+            })
+        }
+        page++
+    }
+}()
+```
+
+- **为什么异步？** 用户配置数据量可能极大（用户数 × 插件数），同步加载会阻塞 HTTP 服务启动。分页 1000 条/页是典型的批量优化。
+- `CallUserConfig` 是 super=false，所以被禁用的插件的 `UserConfigReceiver` 会被自动跳过——这也是为什么它必须放在阶段二之后（StatusManager 已恢复）。
+- 3a 先注入读取函数，再启动 3b 的恢复 goroutine：顺序保证了恢复过程中如果某个插件需要读其他用户的配置，`GetPluginUserConfig` 函数已经可用。
+
+**三阶段与 super 标记的耦合关系**：
+
+| 阶段 | 涉及扩展点 | super 值 | 执行模式 | 依赖前提 |
+|---|---|---|---|---|
+| 阶段一 | KVStorage | `true` | 同步 | 仅依赖 DB/Cache 已连接 |
+| 阶段二 | Config / Cache / VectorSearch | Config:`true` / 其余:`false` | 同步 | 阶段一完成 + StatusManager 先于 Cache/VS 恢复 |
+| 阶段三 | UserConfig | `false` | 异步 goroutine | 阶段二完成（StatusManager 就绪）+ 读取函数已注入 |
+
+### 3.7 Config 与 UserConfig super 不对称的设计解析
+
+两者在扩展点声明上存在明确不对称：
+
+| 维度 | `Config`（管理员配置） | `UserConfig`（用户配置） |
+|---|---|---|
+| super 标记 | `MakePlugin[Config](true)` [config.go#L133](file:///d:/fz/0601-1/solo-dogfeeding/code/68-answer/plugin/config.go#L133) | `MakePlugin[UserConfig](false)` [user_config.go#L36](file:///d:/fz/0601-1/solo-dogfeeding/code/68-answer/plugin/user_config.go#L36) |
+| 调用方（Controller） | `controller_admin/plugin_controller.go` 管理端三处调用 [L81/L184/L211](file:///d:/fz/0601-1/solo-dogfeeding/code/68-answer/internal/controller_admin/plugin_controller.go#L81) | `controller/user_plugin_controller.go` 用户端三处调用 [L58/L89/L141](file:///d:/fz/0601-1/solo-dogfeeding/code/68-answer/internal/controller/user_plugin_controller.go#L58) |
+| 面向对象 | 管理员（全局） | 已登录用户（个人维度） |
+| 数据量 | 小（插件数条） | 大（用户数 × 插件数） |
+
+**不对称的三层设计原因**：
+
+1. **管理端需要"看见"被禁用插件的配置**
+   - 管理员在插件管理列表（`GetPluginList`）中需要区分哪些插件有配置、哪些没有，以便决定是否启用。
+   - 管理员点击某个被禁用插件时，需要能预先填写/修改它的配置，再点击"启用"——如果 Config 是 super=false，`GetPluginConfig`（`CallConfig`）会直接跳过，管理员无法为被禁用插件预填配置。
+   - 这与 `Base` 设为 super=true 的逻辑完全一致（禁用的插件也必须在列表中可见才能被启用）。
+
+2. **用户端必须"看不见"被禁用插件的配置**
+   - 插件一旦禁用，用户在个人设置页不应再看到该插件的配置入口（`CallUserConfig` 返回空），也不应再允许写入。
+   - UserConfig 面向用户行为，插件不启用就意味着此功能对该用户不可用。
+
+3. **初始化恢复顺序的依赖不同**
+   - ConfigReceiver 在阶段二同步恢复，且需要在 `CallCache` 之前完成（Cache 插件自身的 Config 必须先被喂进内存才能正确接管全局 Cache）。Config super=true 保证即便 Cache 插件处于"尚未启用"的中间状态，它的 ConfigReceiver 仍能被调用。
+   - UserConfigReceiver 在阶段三异步恢复，此时 StatusManager 已完全就绪，super=false 可以正确过滤掉被禁用的插件。
 
 ---
 
@@ -461,26 +580,20 @@ type Captcha interface {
 1. **后端生成模式**：实现 `Create()` 返回验证码图片 base64 和正确答案，`Verify()` 比对答案
 2. **第三方服务模式**：不实现 `Create()`（返回空），`GetConfig()` 返回第三方服务配置，`Verify()` 调用第三方 API 校验
 
-### 5.2 CallCaptcha 的选择逻辑（重要纠正）
+### 5.2 CallCaptcha 的选择逻辑
 
-**之前文档中的错误**："CallCaptcha 的实现确保只调用第一个注册的 Captcha 插件"。
-
-**代码事实**：CallCaptcha 的实现是**两次遍历 + 选第一个已启用的**，逻辑比单纯"第一个注册"更复杂。
-
-[captcha.go#L42-L57](file:///d:/fz/0601-1/solo-dogfeeding/code/68-answer/plugin/captcha.go#L42-L57)：
+CallCaptcha 在 [captcha.go#L42-L57](file:///d:/fz/0601-1/solo-dogfeeding/code/68-answer/plugin/captcha.go#L42-L57) 采用**两次遍历**策略，从所有**已启用**的 Captcha 中选出**唯一的**一个来执行回调：
 
 ```go
 func CallCaptcha(fn func(fn Captcha) error) error {
-    // 第一次遍历：找到第一个已启用的 Captcha 的 slugName
     slugName := ""
     _ = callCaptcha(func(captcha Captcha) error {
         slugName = captcha.Info().SlugName
-        return nil   // 不 break，继续遍历，但 slugName 最终会是最后一个
+        return nil   // 不 break，slugName 每次被覆盖
     })
     if slugName == "" {
-        return nil  // 没有已启用的 Captcha，直接返回
+        return nil
     }
-    // 第二次遍历：只调用 slugName 匹配的那个
     return callCaptcha(func(captcha Captcha) error {
         if captcha.Info().SlugName == slugName {
             return fn(captcha)
@@ -490,26 +603,99 @@ func CallCaptcha(fn func(fn Captcha) error) error {
 }
 ```
 
-**逐层分析**：
+**逐层代码分析**：
 
-1. `callCaptcha` 本身来自 `MakePlugin[Captcha](false)`，因此传入的闭包只对**已启用**的 Captcha 执行（`StatusManager.IsEnabled` 过滤）。
-2. 第一次遍历时，遍历顺序由 Stack 中注册顺序决定，`slugName` 在每次执行时被覆盖，最终值等于**遍历顺序最后一个**已启用的 Captcha 的 slugName。
-3. 第二次遍历时，只有 slugName 精确匹配的那个 Captcha 才会实际执行 `fn`。
+1. 底层 `callCaptcha` 来自 `MakePlugin[Captcha](false)`，Stack 在遍历中会先检查 `StatusManager.IsEnabled(slugName)`，所以闭包只对**已启用**的 Captcha 执行。
+2. 第一次遍历：闭包对每个已启用 Captcha 执行 `slugName = captcha.Info().SlugName`，**不 return error 也不 break**，`slugName` 被逐个覆盖，最终值为**注册顺序最后一个**已启用的 slugName。
+3. 第二次遍历：只对 slugName 精确匹配的那一个执行 `fn`。
 
-**结论**：
-- 在 coordinatedCaptchaPlugins 的保证下，同一时刻最多只有一个 Captcha 启用，此时 slugName 就是那个唯一的，两次遍历等价于"调用那一个"。
-- 如果 coordinated 被绕过（如手动改 DB 启用多个），**生效的是注册顺序最后一个**，而非第一个。这与之前描述的"调用第一个注册的"恰好相反。
+**选择结论（与 5.7 时序图、7.6 总结完全一致）**：
+- **正常路径**（coordinatedCaptchaPlugins 保证最多一个启用）：slugName 就是那个唯一的，两次遍历等价于"调用那一个"，顺序问题无实际影响。
+- **异常路径**（绕过 coordinated 手动启用多个）：**生效的是注册顺序最后一个已启用的** Captcha，而非第一个。这是因为闭包不 break、slugName 被覆盖赋值的代码行为决定的。
+- 整个系统中 `plugin.CaptchaEnabled()`、`GenerateCaptcha`、`VerifyCaptcha`、`CaptchaController.GetCaptchaConfig` 等所有 Captcha 调用点**全部走 CallCaptcha**，因此上述选择结论对全系统一致有效。
 
-### 5.3 互斥机制（纠正后的完整说明）
+### 5.3 Captcha 双闸门验证机制
+
+每个业务操作的验证码校验不是单一判断，而是通过 `ActionRecordVerifyCaptcha` 串联的**两道闸门**，代码在 [captcha_service.go#L95-L107](file:///d:/fz/0601-1/solo-dogfeeding/code/68-answer/internal/service/action/captcha_service.go#L95-L107)：
+
+```go
+func (cs *CaptchaService) ActionRecordVerifyCaptcha(
+    ctx context.Context, actionType, unit, captchaID, captchaCode string,
+) bool {
+    // 闸门一：频率/行为策略判断
+    verificationResult := cs.ValidationStrategy(ctx, unit, actionType)
+    if verificationResult {
+        return true   // 闸门一放行，直接通过，不进入闸门二
+    }
+    // 闸门二：验证码本身校验
+    pass, err := cs.VerifyCaptcha(ctx, captchaID, captchaCode)
+    if err != nil {
+        return false
+    }
+    return pass
+}
+```
+
+**闸门一：ValidationStrategy（频率/行为策略）** [captcha_strategy.go#L32-L73](file:///d:/fz/0601-1/solo-dogfeeding/code/68-answer/internal/service/action/captcha_strategy.go#L32-L73)
+
+```go
+func (cs *CaptchaService) ValidationStrategy(ctx, unit, actionType string) bool {
+    // 前置短路：未启用任何 Captcha 插件 → 全部放行
+    if !plugin.CaptchaEnabled() {
+        return true
+    }
+    info, _ := cs.captchaRepo.GetActionType(ctx, unit, actionType)
+    switch actionType {
+    case entity.CaptchaActionEmail:    return cs.CaptchaActionEmail(ctx, unit, info)   // 每次都需要
+    case entity.CaptchaActionPassword: return cs.CaptchaActionPassword(ctx, unit, info) // 30min≥3次
+    // ...共 12 种 action，各有独立阈值
+    }
+    return false
+}
+```
+
+- 返回值语义：`true` = 放行（无需验证码），`false` = 需进入闸门二。
+- 每种操作类型有独立的阈值规则（详见 5.6 表格），基于"操作频率 + 时间窗口"双重判定。
+- 对 password/search/edit_userinfo 三种操作还附带**窗口过期自动清零**：超过时间窗口后将计数器重置为 0。
+
+**闸门二：VerifyCaptcha（验证码本身校验）** [captcha_service.go#L152-L162](file:///d:/fz/0601-1/solo-dogfeeding/code/68-answer/internal/service/action/captcha_service.go#L152-L162)
+
+```go
+func (cs *CaptchaService) VerifyCaptcha(ctx, key, captcha string) (bool, error) {
+    realCaptcha, _ := cs.captchaRepo.GetCaptcha(ctx, key)  // 从 Cache 取正确答案
+    _ = plugin.CallCaptcha(func(fn plugin.Captcha) error {
+        isCorrect = fn.Verify(realCaptcha, captcha)          // 交给插件 Verify() 比对
+        return nil
+    })
+    _ = cs.captchaRepo.DelCaptcha(ctx, key)  // 无论对错，一次性验证码立即删除
+    return isCorrect, nil
+}
+```
+
+- 从 Cache 按 `captcha_id` 取出 `realCaptcha`（GenerateCaptcha 时写入，含 TTL）。
+- 通过 CallCaptcha 委托给当前生效的（注册顺序最后一个已启用的）Captcha 插件执行 `Verify(realCaptcha, userInput)`——后端生成模式直接字符串比对，第三方服务模式调外部 API。
+- **删除即失效**：`DelCaptcha` 确保同一个验证码不能被重复使用（防重放）。
+
+**两道闸门的组合语义**：
+
+| 闸门一（策略） | 闸门二（验证码） | 整体结果 | 含义 |
+|---|---|---|---|
+| `true`（放行） | 不执行 | `true` 通过 | 频率/行为未触发阈值，不需要验证码 |
+| `false`（触发） | `true`（正确） | `true` 通过 | 触发了阈值，但验证码正确 |
+| `false`（触发） | `false`（错误/过期） | `false` 拒绝 | 触发了阈值且验证码校验失败 |
+
+**设计意图**：闸门一用极低成本的内存/缓存计数挡住绝大多数正常请求，只有高频或可疑请求才进入闸门二（可能涉及第三方 API 调用或额外计算），在保证安全的前提下把性能开销降到最低。
+
+### 5.4 互斥机制（纠正后的完整说明）
 
 Captcha 插件的互斥通过两层保障：
 
 1. **StatusManager 层面**：[coordinatedCaptchaPlugins](file:///d:/fz/0601-1/solo-dogfeeding/code/68-answer/plugin/captcha.go#L67-L82) 在 `Enable(name, true)` 时，收集除 `name` 之外的所有 Captcha slugName，然后由 StatusManager 把它们都置为 false。
-2. **CallCaptcha 层面**：即便多个同时启用（如绕过 StatusManager），CallCaptcha 的两次遍历逻辑也只会调用"注册顺序最后一个已启用"的插件。
+2. **CallCaptcha 层面**：即便多个同时启用（如绕过 StatusManager），CallCaptcha 的两次遍历逻辑也只会调用"**注册顺序最后一个已启用**"的插件（结论与 5.2、7.6 一致）。
 
 两者结合使得 Captcha 在正常使用下始终只有一个生效。
 
-### 5.4 前端配置获取
+### 5.5 前端配置获取
 
 路由 `GET /captcha/config` 由 [CaptchaController.GetCaptchaConfig](file:///d:/fz/0601-1/solo-dogfeeding/code/68-answer/internal/controller/plugin_captcha_controller.go#L45-L53) 处理：
 
@@ -525,9 +711,9 @@ func (uc *CaptchaController) GetCaptchaConfig(ctx *gin.Context) {
 }
 ```
 
-返回当前激活的 Captcha 插件的 slug_name 和配置信息，前端据此初始化验证码组件。
+通过 CallCaptcha 返回当前激活的（注册顺序最后一个已启用的）Captcha 插件的 slug_name 和配置信息，前端据此初始化验证码组件。
 
-### 5.5 CaptchaService — 验证策略引擎
+### 5.6 CaptchaService — 验证策略引擎
 
 [action/captcha_service.go](file:///d:/fz/0601-1/solo-dogfeeding/code/68-answer/internal/service/action/captcha_service.go) 和 [captcha_strategy.go](file:///d:/fz/0601-1/solo-dogfeeding/code/68-answer/internal/service/action/captcha_strategy.go) 实现了完整的验证码策略。
 
@@ -551,10 +737,10 @@ func (uc *CaptchaController) GetCaptchaConfig(ctx *gin.Context) {
 **核心方法**：
 
 1. `ActionRecord` — 预检查是否需要验证码，需要的话生成并返回验证码图片+id
-2. `ValidationStrategy` — 根据操作类型和频率计算是否需要验证码
+2. `ValidationStrategy` — 闸门一：根据操作类型和频率计算是否需要验证码
 3. `GenerateCaptcha` — 调用 `plugin.CallCaptcha` 生成验证码，正确答案存入 Cache
-4. `VerifyCaptcha` — 从 Cache 取出正确答案，调用 `plugin.CallCaptcha` 的 `Verify()` 校验用户输入
-5. `ActionRecordVerifyCaptcha` — 组合验证：先判断策略是否需要，需要则再验验证码
+4. `VerifyCaptcha` — 闸门二：从 Cache 取出正确答案，调用 `plugin.CallCaptcha` 的 `Verify()` 校验用户输入
+5. `ActionRecordVerifyCaptcha` — 双闸门串联：先跑策略，需要则再验验证码
 6. `ActionRecordAdd` — 操作计数 +1
 7. `ActionRecordDel` — 清除该操作的频率统计（成功后）
 
@@ -566,62 +752,78 @@ if !plugin.CaptchaEnabled() {
 }
 ```
 
-即：如果没有启用任何 Captcha 插件，整个频率校验 + 验证码机制被完全跳过。
+`plugin.CaptchaEnabled()` 内部也是通过 CallCaptcha 实现的（注册顺序最后一个已启用即视为启用），因此与 5.2 节选择结论一致——系统内所有 Captcha 相关判断**全部走同一条 CallCaptcha 选择路径**。
 
-### 5.6 Captcha 业务接入完整时序
+### 5.7 Captcha 业务接入完整时序
 
-以**用户提问**（CaptchaActionQuestion）为例，端到端时序如下：
+以**用户提问**（CaptchaActionQuestion）为例，端到端时序如下（CallCaptcha 选择结论与 5.2、7.6 完全一致）：
 
 ```
-前端                     UserController/QuestionController        CaptchaService          CaptchaRepo        plugin.Captcha     Cache
-  │                              │                                     │                      │                   │                │
-  │ 1. 先调用 GET /user/action/   │                                     │                      │                   │                │
-  │    record?action=question    │                                     │                      │                   │                │
-  │─────────────────────────────▶│                                     │                      │                   │                │
-  │                              │ ActionRecord(req)                    │                      │                   │                │
-  │                              │────────────────────────────────────▶│                      │                   │                │
-  │                              │                                     │ 1a. ValidationStrategy(unit=UserID, question)        │                │
-  │                              │                                     │   ├─ plugin.CaptchaEnabled()                       │                │
-  │                              │                                     │   │   └─ callCaptcha 遍历第一个已启用 → true/false    │                │
-  │                              │                                     │   ├─ captchaRepo.GetActionType()                    │                │
-  │                              │                                     │   └─ 5秒内 或 累计10次? → 需要验证:false             │                │
-  │                              │                                     │                      │                   │                │
-  │                              │                                     │ 若需要: GenerateCaptcha()                          │                │
-  │                              │                                     │──────────────────────────────────────────────────▶│ Create()         │
-  │                              │                                     │                      │                   │ (captcha_img,   │
-  │                              │                                     │                      │                   │  code)           │
-  │                              │                                     │  SetCaptcha(key, code)                                             │
-  │                              │                                     │───────────────────────────────────────────────────────────────────────▶│
-  │                              │◀────────────────────────────────────│ verify=true + captcha_id + captcha_img             │                │
-  │◀─────────────────────────────│                                     │                      │                   │                │
-  │                              │                                     │                      │                   │                │
-  │ 2. 前端弹出验证码弹窗，用户输入   │                                     │                      │                   │                │
-  │    后提交 POST /question/add  │                                     │                      │                   │                │
-  │    (携带 captcha_id + captcha_code)│                                 │                      │                   │                │
-  │─────────────────────────────▶│                                     │                      │                   │                │
-  │                              │ 非管理员: ActionRecordVerifyCaptcha(question, UserID, id, code)                      │                │
-  │                              │────────────────────────────────────▶│                      │                   │                │
-  │                              │                                     │ 2a. ValidationStrategy() —— 再次判断是否仍需要验证   │                │
-  │                              │                                     │                      │                   │                │
-  │                              │                                     │ 若需要验证:                                          │                │
-  │                              │                                     │ VerifyCaptcha(key, code)                            │                │
-  │                              │                                     │   ├─ GetCaptcha(key)                                  │                │
-  │                              │                                     │   │                     ───────────────────────────────────────────────▶│
-  │                              │                                     │   │   ◀────────────── realCaptcha                     │                │
-  │                              │                                     │   ├─ plugin.CallCaptcha → Verify(realCaptcha, code)  │                │
-  │                              │                                     │   │                     ────────────────────────────────────────────▶│
-  │                              │                                     │   └─ DelCaptcha(key)                                  │                │
-  │                              │                                     │                         ─────────────────────────────────────────────▶│
-  │◀──── 验证失败：400 + captcha错误 │                                     │                      │                   │                │
-  │                              │                                     │                      │                   │                │
-  │                              │ 验证通过则继续：                       │                      │                   │                │
-  │                              │ ActionRecordAdd(question, UserID)    │                      │                   │                │
-  │                              │────────────────────────────────────▶│ SetActionType(+1)    │                   │                │
-  │                              │                                     │─────────────────────▶│                   │                │
-  │                              │ questionService.AddQuestion()        │                      │                   │                │
-  │                              │  ...持久化提问...                     │                      │                   │                │
-  │◀─────────────────────────────│ 成功：{question_id}                  │                      │                   │                │
+前端                     QuestionController           CaptchaService          CaptchaRepo    plugin.CallCaptcha      Cache
+  │                              │                           │                      │            (最后一个已启用)    │
+  │ 1. GET /user/action/record   │                           │                      │                  │          │
+  │    ?action=question          │                           │                      │                  │          │
+  │─────────────────────────────▶│                           │                      │                  │          │
+  │                              │ ActionRecord(req)         │                      │                  │          │
+  │                              │──────────────────────────▶│                      │                  │          │
+  │                              │                           │ 1a. ValidationStrategy (闸门一)          │          │
+  │                              │                           │   ├─ plugin.CaptchaEnabled()             │          │
+  │                              │                           │   │   └─ CallCaptcha: 两次遍历取           │          │
+  │                              │                           │   │      注册顺序最后一个已启用 → true     │          │
+  │                              │                           │   ├─ captchaRepo.GetActionType(unit=UID) │          │
+  │                              │                           │   └─ 5秒内 或 累计10次? → false(需验证)   │          │
+  │                              │                           │                                              │
+  │                              │                           │ 1b. 若需要验证: GenerateCaptcha()         │          │
+  │                              │                           │   ├─ token.GenerateToken() → key          │          │
+  │                              │                           │   ├─ CallCaptcha → Create()               │          │
+  │                              │                           │   │          (两次遍历取注册顺序最后一个)    │          │
+  │                              │                           │   │     ───────────────────────────────────────────▶│
+  │                              │                           │   │     ◀──── captcha_img + realCaptcha    │          │
+  │                              │                           │   └─ SetCaptcha(key, realCaptcha)         │          │
+  │                              │                           │                ──────────────────────────────────────▶│
+  │                              │◀──────────────────────────│ verify=true + captcha_id + captcha_img    │          │
+  │◀─────────────────────────────│                           │                      │                  │          │
+  │                              │                           │                      │                  │          │
+  │ 2. 前端 useCaptchaModal      │                           │                      │                  │          │
+  │    弹窗，用户输入后提交       │                           │                      │                  │          │
+  │    POST /question/add        │                           │                      │                  │          │
+  │    (携带 captcha_id+code)    │                           │                      │                  │          │
+  │─────────────────────────────▶│                           │                      │                  │          │
+  │                              │ 非管理员:                  │                      │                  │          │
+  │                              │ ActionRecordVerifyCaptcha │                      │                  │          │
+  │                              │ (question, UID, id, code) │                      │                  │          │
+  │                              │──────────────────────────▶│                      │                  │          │
+  │                              │                           │ 2a. ValidationStrategy (闸门一) ——再次判定 │          │
+  │                              │                           │   仍需验证 → false                     │          │
+  │                              │                           │                      │                  │          │
+  │                              │                           │ 2b. VerifyCaptcha (闸门二)               │          │
+  │                              │                           │   ├─ GetCaptcha(key)                       │          │
+  │                              │                           │   │           ──────────────────────────────────────▶│
+  │                              │                           │   │   ◀──────────────── realCaptcha        │          │
+  │                              │                           │   ├─ CallCaptcha → Verify(realCaptcha, code)         │
+  │                              │                           │   │          (两次遍历取注册顺序最后一个)    │          │
+  │                              │                           │   │     ───────────────────────────────────────────▶│
+  │                              │                           │   │     ◀─────── true/false               │          │
+  │                              │                           │   └─ DelCaptcha(key)                       │          │
+  │                              │                           │                ──────────────────────────────────────▶│
+  │◀──── 验证失败：400 + captcha错误 │                        │                      │                  │          │
+  │                              │                           │                      │                  │          │
+  │                              │ 验证通过则继续：            │                      │                  │          │
+  │                              │ ActionRecordAdd           │                      │                  │          │
+  │                              │ (question, UID)           │                      │                  │          │
+  │                              │──────────────────────────▶│ SetActionType(+1)    │                  │          │
+  │                              │                           │─────────────────────▶│                  │          │
+  │                              │ questionService           │                      │                  │          │
+  │                              │ .AddQuestion()            │                      │                  │          │
+  │                              │  ...持久化提问...          │                      │                  │          │
+  │◀─────────────────────────────│ 成功：{question_id}       │                      │                  │          │
 ```
+
+**CallCaptcha 选择结论在本时序中的三处体现（与 5.2、7.6 对齐）**：
+- ① `plugin.CaptchaEnabled()`：CallCaptcha 能取到即视为启用
+- ② `GenerateCaptcha` → `CallCaptcha → Create()`
+- ③ `VerifyCaptcha` → `CallCaptcha → Verify()`
+- 三处全部遵循"注册顺序最后一个已启用"的同一选择逻辑。
 
 **主要接入点**（代码位置）：
 
@@ -637,16 +839,95 @@ if !plugin.CaptchaEnabled() {
 
 > 注意：所有接入点都先判断 `!isAdmin`——管理员**不受验证码约束**。此外，`question`/`answer`/`comment` 等操作对于拥有"免链接限制"权限的用户也跳过验证码检查（由 `canList` 数组控制）。
 
-### 5.7 前端 Captcha 集成
+### 5.8 useCaptchaModal 前端状态机
 
-[useCaptchaModal](file:///d:/fz/0601-1/solo-dogfeeding/code/68-answer/ui/src/hooks/useCaptchaModal/index.tsx) 是前端验证码的 React Hook，负责：
+前端验证码交互由 [useCaptchaModal/index.tsx](file:///d:/fz/0601-1/solo-dogfeeding/code/68-answer/ui/src/hooks/useCaptchaModal/index.tsx) 这个自定义 Hook 管理，内部是一个状态机。
 
-- 调用 `checkImgCode` API 获取验证码配置和图片
-- 渲染验证码弹窗（图片 + 输入框 + 刷新按钮）
-- 通过 `resolveCaptchaReq` 将 `captcha_id` 和 `captcha_code` 注入业务请求
-- 通过 `handleCaptchaError` 处理后端返回的验证码错误，自动弹窗重试
+**核心状态变量**：
 
-**交互流程**：初次请求时不弹窗（`check()` 先尝试无验证码提交）；如果后端返回 captcha_code 错误，再弹窗提示用户输入并携带重试。
+| 状态变量 | 类型 | 含义 |
+|---|---|---|
+| `stateShow` | `boolean` | Modal 弹窗是否可见 |
+| `captcha` | `{captcha_id, captcha_img, verify}` | 后端下发的验证码信息。`verify=true` 表示当前业务被策略闸门判定为需要验证 |
+| `imgCode` | `{value, isInvalid, errorMsg}` | 用户输入状态 |
+| `pending` | `ref<boolean>` | 正在请求验证码数据，防重入 |
+| `refCallback` | `ref<SubmitCallback>` | 挂起的业务提交回调，验证码通过后执行 |
+
+**状态机变迁图**：
+
+```
+                ┌─────────────────────┐
+                │      初始态          │
+                │ stateShow=false      │
+                │ captcha.verify=false │
+                │ imgCode.value=''     │
+                └──────────┬──────────┘
+                           │
+          autoInitCaptcha? │  (email类立即预取)
+                           │
+                           ▼
+                ┌─────────────────────┐
+                │  预取验证码待触发     │
+                │ captcha.verify 待后端 │
+                │   ActionRecord 返回   │
+                └──────────┬──────────┘
+                           │
+                   check(submitFunc)
+                           │
+             ┌─────────────┴─────────────┐
+             │                           │
+    captcha.verify=false         captcha.verify=true
+    (闸门一放行，直接提交)       (闸门一触发，需验证)
+             │                           │
+             ▼                           ▼
+    ┌────────────────┐         ┌────────────────────┐
+    │ 直接执行业务    │         │ show() 弹窗显现      │
+    │ submitFunc()   │         │ stateShow=true      │
+    └────────────────┘         └─────────┬──────────┘
+                                         │
+                               用户输入验证码
+                               handleChange()
+                                         │
+                                         ▼
+                               ┌────────────────────┐
+                               │ 点击"验证"按钮       │
+                               │ handleSubmit()      │
+                               └─────────┬──────────┘
+                                         │
+                                         ▼
+                               ┌────────────────────┐
+                               │ 执行 refCallback    │
+                               │ (提交业务请求，附带  │
+                               │  captcha_id+code)   │
+                               └─────────┬──────────┘
+                                         │
+                        ┌────────────────┴────────────────┐
+                        │                                 │
+               后端返回非captcha错误               后端返回captcha_code错误
+               (业务成功或其他校验失败)            (验证码错误或需要重新触发)
+                        │                                 │
+                        ▼                                 ▼
+               ┌────────────────┐               ┌────────────────────┐
+               │ handleCaptcha  │               │ handleCaptchaError │
+               │ Error() → close │               │ → fetchCaptchaData │
+               │ 关闭弹窗，清空状态 │             │ → 保留弹窗，刷新图片 │
+               └────────────────┘               │ → (首次触发不显示错 │
+                                                │    误，非首次显示)  │
+                                                └────────────────────┘
+```
+
+**对外 API 的行为语义**：
+
+- `check(submitFunc)`：业务代码的统一入口。若 `captcha.verify=false` 直接执行 `submitFunc()` 并返回 `true`；若 `captcha.verify=true` 仅弹窗并返回 `false`，真实提交延后到 `handleSubmit()`。
+- `resolveCaptchaReq(req)`：把当前持有的 `captcha_id` 和 `captcha_code` 注入业务请求体——仅当 `captcha.verify=true` 时才注入，`verify=false` 不注入字段。
+- `handleCaptchaError(fieldErrors)`：统一处理后端返回的错误。若含 `captcha_code` 错误：
+  - 首次触发（`imgCode.value` 为空）：只刷新验证码并弹窗，**不显示错误红框**（用户还没输过）。
+  - 非首次（`imgCode.value` 非空）：显示错误红框 + 刷新验证码 + 弹窗。
+  - 若不含 captcha 错误（业务成功或其他失败）：关闭弹窗并清空所有状态。
+- `fetchCaptchaData()`：调用 `checkImgCode` API（后端走 `ActionRecord` → `ValidationStrategy` → `GenerateCaptcha`），拉取新的 `captcha_id`/`captcha_img`/`verify` 三元组。
+
+**与后端双闸门的协同**：
+前端的 `captcha.verify` 字段就是后端 `ActionRecord` 中闸门一（ValidationStrategy）判定结果的直接下发；用户提交后后端会再次跑闸门一+闸门二（双保险），前端 `verify` 只是 UX 优化（提前弹窗减少一次失败往返）。
 
 ---
 
@@ -732,9 +1013,14 @@ if !plugin.CaptchaEnabled() {
 - **用户配置（UserConfig，super=false）**：用户维度，仅插件启用时可见
 - **KV 存储（KVStorage，super=true）**：插件自定义数据，始终可操作以便清理/迁移
 
-### 7.4 运行时配置恢复
+### 7.4 运行时配置恢复：三阶段代码串联
 
-系统启动时，`initPluginData` 按序恢复：KVOperator 注入 → 状态恢复 → 管理员配置恢复 → Cache 替换 → VectorSearch 同步器 → UserConfig 读取函数注入 → 用户配置恢复。这个顺序保证 KV 在状态之前初始化，而 `super=false` 的 UserConfig 恢复时可以根据 StatusManager 正确跳过被禁用的插件。
+系统启动时 `initPluginData` 分为三个严格顺序的阶段（详见 3.6 节）：
+- **阶段一（同步）**：KVStorage 注入 Operator，super=true，不依赖状态
+- **阶段二（同步）**：StatusManager 恢复 → ConfigReceiver 恢复（super=true）→ Cache/VectorSearch 插件接管（super=false，此时状态已就绪）。此阶段完成后 HTTP 服务可响应请求
+- **阶段三（异步 goroutine）**：UserConfig 读取函数注入 → 分页恢复 UserConfigReceiver（super=false，自动跳过被禁用插件）
+
+三阶段与 super 标记精确耦合：阶段一只操作 super=true 的 KVStorage，阶段二先恢复状态再依次操作 super=true 的 Config 和 super=false 的 Cache/VectorSearch，阶段三在状态完全就绪后异步处理 super=false 的 UserConfig。
 
 ### 7.5 互斥协调的真实范围
 
@@ -742,15 +1028,49 @@ if !plugin.CaptchaEnabled() {
 - **事实上单实例**（无 coordinated，但调用方都只取一个）：UserCenter —— 所有便捷函数和 Controller 都取遍历顺序第一个已启用的实例
 - **多实例并行**（每个都被调用）：Connector、Parser、Filter、Notification、Reviewer 等
 
-### 7.6 CallCaptcha 的选择逻辑
+### 7.6 CallCaptcha 的选择逻辑（与 5.2、5.7 结论完全一致）
 
-在 coordinated 正常生效的前提下（一个 Captcha 启用），CallCaptcha 的"两次遍历"等价于"调用那个唯一的"。但当 coordinated 被绕过导致多个 Captcha 启用时，生效的是**注册顺序最后一个已启用**的 Captcha，这一细节由 slugName 在第一次遍历中被**覆盖赋值**决定。
+CallCaptcha 采用**两次遍历**策略（[captcha.go#L42-L57](file:///d:/fz/0601-1/solo-dogfeeding/code/68-answer/plugin/captcha.go#L42-L57)）：
+1. 第一次遍历：对每个已启用 Captcha 执行 `slugName = captcha.Info().SlugName`，闭包不 break，slugName 被逐个**覆盖赋值**，最终值为**注册顺序最后一个**已启用的 slugName
+2. 第二次遍历：只对 slugName 精确匹配的那一个执行业务回调
 
-### 7.7 UserCenter 的代理模式
+**统一结论（在 5.2、5.7、7.6 三处完全对齐）**：
+- **正常路径**（coordinatedCaptchaPlugins 保证最多一个启用）：两次遍历等价于"调用那一个"
+- **异常路径**（绕过 coordinated 手动启用多个）：生效的是**注册顺序最后一个已启用**的 Captcha，而非第一个
+- 系统内所有 Captcha 调用点（`CaptchaEnabled()`、`GetCaptchaConfig`、`GenerateCaptcha`、`VerifyCaptcha`）**全部走同一条 CallCaptcha 路径**，选择结论全局一致
+
+### 7.7 Config 与 UserConfig 的 super 不对称设计
+
+`Config` super=true 而 `UserConfig` super=false 的三层设计原因（详见 3.7 节）：
+1. **管理端可见性**：管理员必须能为被禁用插件预填配置后再启用，Config super=true 保证禁用状态下 `CallConfig` 仍可返回配置字段，逻辑与 `Base` super=true 一致
+2. **用户端隐藏性**：插件禁用后用户不应再看到或修改其个人配置，UserConfig super=false 保证 `CallUserConfig` 自动跳过
+3. **初始化顺序依赖**：ConfigReceiver 在阶段二同步恢复且必须先于 Cache 插件接管；UserConfigReceiver 在阶段三异步恢复，依赖 StatusManager 已就绪才能正确过滤
+
+### 7.8 双闸门验证
+
+Captcha 业务接入采用**双闸门**设计（详见 5.3 节）：第一闸门 `ValidationStrategy` 判断频率是否超阈值，第二闸门 `VerifyCaptcha` 校验验证码正确性。第一闸门通过则短路跳过第二闸门。无 Captcha 插件时第一闸门首行 `!plugin.CaptchaEnabled()` 短路返回 true，整个验证码机制零成本。两次闸门之间职责分离：闸门一用内存/缓存计数挡掉绝大多数正常请求，闸门二仅对高风险请求才可能产生第三方 API 调用等昂贵计算。
+
+### 7.9 useCaptchaModal 前端状态机
+
+前端通过 `check(submitFunc)` 实现**两阶段提交**（详见 5.8 节）：频率未触发时直接执行业务函数；频率触发时弹窗等用户输入后通过 `refCallback` 延迟提交。email 操作因策略为"每次都需要"而自动预加载验证码。`handleCaptchaError` 对首次触发静默弹窗、对输错显示错误信息。`pending` ref 防止并发请求。前端 `captcha.verify` 只是后端闸门一判定结果的 UX 镜像，实际提交时后端会再次跑双闸门校验，双端不互信。
+
+### 7.10 UserCenter 的代理模式
 
 UserCenter 插件采用代理模式：它不替换原有用户体系，而是通过能力声明（`UserCenterDesc`）告诉 Answer 哪些功能由外部用户中心接管。Answer 据此在管理后台禁用相应功能（状态/角色/密码/创建用户），避免操作冲突。同时通过 `EnabledOriginalUserSystem` 控制原系统用户体系的去留。
 
-### 7.8 Captcha 业务集成的"三明治"结构
+### 7.11 Captcha 业务集成的"三明治"结构
+
+每个业务接入点都遵循统一的**三明治结构**：
+1. **上层**：Controller 先判断角色（管理员/免链接限制），非管理员才调用 `ActionRecordVerifyCaptcha`
+2. **中层**：CaptchaService 先跑频率策略（ValidationStrategy 闸门一），需要则再验验证码（VerifyCaptcha 闸门二）
+3. **下层**：plugin.Captcha 接口屏蔽具体实现（后端生成 or 第三方服务），CallCaptcha 统一按"注册顺序最后一个已启用"选择
+4. **收尾**：验证通过则 `ActionRecordAdd` 计数 +1，成功完成则 `ActionRecordDel` 清除
+
+### 7.10 UserCenter 的代理模式
+
+UserCenter 插件采用代理模式：它不替换原有用户体系，而是通过能力声明（`UserCenterDesc`）告诉 Answer 哪些功能由外部用户中心接管。Answer 据此在管理后台禁用相应功能（状态/角色/密码/创建用户），避免操作冲突。同时通过 `EnabledOriginalUserSystem` 控制原系统用户体系的去留。
+
+### 7.11 Captcha 业务集成的"三明治"结构
 
 每个业务接入点都遵循统一的**三明治结构**：
 1. **上层**：Controller 先判断角色（管理员/免链接限制），非管理员才调用 `ActionRecordVerifyCaptcha`
