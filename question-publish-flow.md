@@ -1044,3 +1044,224 @@ defer func() {
 - 如果请求因校验失败返回 400/403，说明请求根本没生效，此时应**清除锁键**，允许用户修正后重新提交
 - 如果请求成功返回 200，锁键保留 5 分钟自动过期，期间相同内容的重复请求被拦截
 - `defer` 确保 Clear 逻辑在函数返回时一定执行，无论成功还是 panic
+
+**匿名用户退化（补充）**：[auth.go#L270-L275](file:///d:/fz/0601-1/solo-dogfeeding/code/61-answer/internal/base/middleware/auth.go#L270-L275)
+
+`GetLoginUserIDFromContext(ctx)` 在用户未登录时返回空字符串 `""`，此时防重键退化为：
+
+```
+MD5("" + ":" + fullPath + ":" + reqJson)
+```
+
+所有匿名用户共享同一个防重键，任意匿名用户提交后，5 分钟内**所有其他匿名用户**提交相同内容都会被判定为重复请求。这是一个设计缺陷：匿名防重退化为全局防重，而非按用户隔离。
+
+---
+
+## 十六、Cache 后端默认是 memory in-process，多副本失效
+
+**初始化**: [internal/base/data/data.go#L97-L137](file:///d:/fz/0601-1/solo-dogfeeding/code/61-answer/internal/base/data/data.go#L97-L137)
+
+```go
+func NewCache(c *CacheConf) (cache.Cache, func(), error) {
+    // 第一步：尝试加载 Cache 插件
+    var pluginCache plugin.Cache
+    _ = plugin.CallCache(func(fn plugin.Cache) error {
+        pluginCache = fn
+        return nil
+    })
+    if pluginCache != nil {
+        return pluginCache, func() {}, nil  // 有插件 → 用插件（如 Redis）
+    }
+
+    // 第二步：无插件 → 使用进程内内存缓存
+    memCache := memory.NewCache()       // pacman/contrib/cache/memory
+
+    // 可选：从文件加载缓存快照（冷启动加速）
+    if len(c.FilePath) > 0 {
+        cacheFileDir := filepath.Dir(c.FilePath)
+        if err := memory.Load(memCache, c.FilePath); err != nil {
+            // ... load 失败忽略 ...
+        }
+    }
+
+    // 可选：定时持久化缓存到文件（默认 30s 一次）
+    if len(c.FilePath) > 0 {
+        ticker := time.NewTicker(30 * time.Second)
+        go func() {
+            for range ticker.C {
+                memory.Save(memCache, c.FilePath)
+            }
+        }()
+        // shutdown 时也 save 一次
+    }
+    return memCache, cleanup, nil
+}
+```
+
+**关键事实**：
+
+1. **默认无插件时走 memory**：`memory.NewCache()` 返回的是基于 `sync.Map` 的纯内存实现，**每个进程一份独立副本**
+2. **插件优先**：若注册了 `plugin.Cache`（如 Redis 插件），则使用插件，此时多副本共享同一缓存
+3. **文件持久化是兜底**：`FilePath` 配置项只是为了重启后恢复缓存快照，不是分布式方案
+4. **多副本部署失效**：默认配置下，每个节点各自维护独立 Cache，防重锁、频控、会话等依赖 Cache 的逻辑在多节点间**互不感知**
+5. **DuplicateRequestRejection 受影响最大**：用户两次提交被分发到不同 pod → 各自 Cache 都查不到 → 防重完全失效
+
+**memory cache 实现**：来自 `github.com/segmentfault/pacman/contrib/cache/memory`，内部是 Go `sync.Map` + TTL 轮询清理。
+
+---
+
+## 十七、Captcha 豁免：须 isAdmin 且 linkUrlLimitUser 双满足
+
+**代码**: [internal/controller/question_controller.go#L417-L427](file:///d:/fz/0601-1/solo-dogfeeding/code/61-answer/internal/controller/question_controller.go#L417-L427)
+
+```go
+isAdmin := middleware.GetUserIsAdminModerator(ctx)
+if !isAdmin || !linkUrlLimitUser {
+    captchaPass := qc.actionService.ActionRecordVerifyCaptcha(
+        ctx, entity.CaptchaActionQuestion, req.UserID, req.CaptchaID, req.CaptchaCode)
+    if !captchaPass {
+        // 返回验证码错误
+        handler.HandleResponse(ctx, errors.BadRequest(reason.CaptchaVerificationFailed), errFields)
+        return
+    }
+}
+```
+
+**逻辑分析**：
+
+条件 `!isAdmin || !linkUrlLimitUser` 等价于 `NOT (isAdmin && linkUrlLimitUser)`（德摩根定律）。
+
+即：**只有 isAdmin=true 且 linkUrlLimitUser=true 同时满足时，才豁免验证码校验**。只要任一不满足，就必须验证。
+
+| isAdmin | linkUrlLimitUser | 结果 |
+|---------|------------------|------|
+| false | false | 需验证码 |
+| false | true  | 需验证码 |
+| true  | false | 需验证码 |
+| true  | true  | **豁免** |
+
+**`linkUrlLimitUser` 的来源**：从 8 项（或 7 项）权限检查的 `LinkUrlLimit` 结果中来：
+
+```go
+linkUrlLimitUser := canList[7]  // 第 8 项权限（AddQuestion 路径）
+linkUrlLimitUser := canList[6]  // 第 7 项权限（AddQuestionByAnswer 路径）
+```
+
+语义是「用户是否在链接数量限制白名单内」——高信誉或特殊权限用户免链接限制，同时也免验证码。
+
+**其他场景的验证码豁免规则**：
+
+| 操作 | 豁免条件 |
+|------|---------|
+| AddQuestion | `isAdmin && linkUrlLimitUser` |
+| AddQuestionByAnswer | `isAdmin && linkUrlLimitUser` |
+| UpdateQuestion | `isAdmin && linkUrlLimitUser` |
+| DeleteQuestion | 仅 `isAdmin`（单条件） |
+| InvitationAnswer | 仅 `isAdmin`（单条件） |
+
+删除和邀请回答的验证码豁免门槛更低——只要是管理员/版主就豁免，不需要同时满足 linkUrlLimitUser。
+
+---
+
+## 十八、RefreshTagQuestionCount 失败只 log，错误被吞噬
+
+**定义**: [internal/service/tag_common/tag_common.go#L749-L762](file:///d:/fz/0601-1/solo-dogfeeding/code/61-answer/internal/service/tag_common/tag_common.go#L749-L762)
+
+```go
+func (ts *TagCommonService) RefreshTagQuestionCount(ctx context.Context, tagIDs []string) (err error) {
+    for _, tagID := range tagIDs {
+        count, err := ts.tagRelRepo.CountTagRelByTagID(ctx, tagID)
+        if err != nil {
+            return err
+        }
+        err = ts.tagCommonRepo.UpdateTagQuestionCount(ctx, tagID, int(count))
+        if err != nil {
+            return err
+        }
+    }
+    return nil
+}
+```
+
+函数本身正确返回 error，但**调用方**多处只 log 不向上传递：
+
+**调用点 1**：`CreateOrUpdateTagRelList` 末尾 [tag_common.go#L859-L862](file:///d:/fz/0601-1/solo-dogfeeding/code/61-answer/internal/service/tag_common/tag_common.go#L859-L862)
+
+```go
+err = ts.RefreshTagQuestionCount(ctx, needRefreshTagIDs)
+if err != nil {
+    log.Error(err)    // ← 只 log，不 return
+}
+```
+
+**调用点 2**：删除问题后 [question_service.go#L634-L637](file:///d:/fz/0601-1/solo-dogfeeding/code/61-answer/internal/service/content/question_service.go#L634-L637)
+
+```go
+err = qs.tagCommon.RefreshTagQuestionCount(ctx, tagIDs)
+if err != nil {
+    log.Error("efreshTagQuestionCount error", err.Error())  // ← 只 log，不 return
+}
+```
+
+**调用点 3**：回答被接受/取消时更新 tag 计数 [question_service.go#L774-L776](file:///d:/fz/0601-1/solo-dogfeeding/code/61-answer/internal/service/content/question_service.go#L774-L776)
+
+```go
+if err = qs.tagCommon.RefreshTagQuestionCount(ctx, tagIDs); err != nil {
+    log.Errorf("update tag's question count failed, %v", err)  // ← 只 log，不 return
+}
+```
+
+**后果**：标签的 `question_count` 可能与真实数据不一致，但主流程不受影响。属于「数据统计可降级」的设计权衡。
+
+**例外**：`MergeTag` 场景 [tag_service.go#L489-L492](file:///d:/fz/0601-1/solo-dogfeeding/code/61-answer/internal/service/tag/tag_service.go#L489-L492) 是 return error 的，因为标签合并是强一致性操作。
+
+---
+
+## 十九、Queue Send：buffer 满 + ctx 取消 + 另有 3 条 drop 路径
+
+**Send 方法**: [internal/base/queue/queue.go#L61-L78](file:///d:/fz/0601-1/solo-dogfeeding/code/61-answer/internal/base/queue/queue.go#L61-L78)
+
+```go
+func (q *Queue[T]) Send(ctx context.Context, msg T) {
+    q.mu.RLock()
+    defer q.mu.RUnlock()
+
+    if q.closed {
+        log.Warnf("[%s] queue is closed, dropping message", q.name)
+        return   // ← drop 路径 1：队列已关闭
+    }
+
+    select {
+    case q.queue <- msg:
+        log.Debugf("[%s] enqueued message: %+v", q.name, msg)
+    case <-ctx.Done():
+        log.Warnf("[%s] context cancelled while sending message", q.name)
+        // ← drop 路径 2：ctx 取消（请求超时/断开等），消息不进队列
+    }
+}
+```
+
+**第三条 drop 路径**：Handler 未注册时 worker 丢弃 [queue.go#L120-L123](file:///d:/fz/0601-1/solo-dogfeeding/code/61-answer/internal/base/queue/queue.go#L120-L123)
+
+```go
+if handler == nil {
+    log.Warnf("[%s] no handler registered, dropping message: %+v", q.name, msg)
+    return   // ← drop 路径 3：handler 未注册，worker 收到消息后直接丢
+}
+```
+
+**三条 drop 路径汇总**：
+
+| 路径 | 位置 | 触发条件 | 日志级别 |
+|------|------|---------|---------|
+| 1 | Send() | `q.closed == true` | Warn |
+| 2 | Send() | `ctx.Done()` 先于 channel 写入 | Warn |
+| 3 | processMessage() | `handler == nil` 未注册 | Warn |
+
+**关于 buffer 满**：
+
+`Send` 没有 default 分支，当 channel buffer 满且 ctx 未取消时，**Send 会阻塞**，直到有空位或 ctx 取消。不是非阻塞丢弃，而是可能阻塞调用者 goroutine（即 HTTP 请求 goroutine）。
+
+这意味着在高并发写入场景下，如果消费速度跟不上，buffer 满会反压到 HTTP handler，导致请求处理时间变长。
+
+**关于 context.TODO**：worker 消费时用 `context.TODO()`，丢弃了原始请求的 ctx，因此即使发送时 ctx 还在，消费时也已经和请求生命周期无关。
