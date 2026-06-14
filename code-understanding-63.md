@@ -504,3 +504,427 @@ VoteService.VoteUp(req.IsCancel=false):
 | 数据实体 | [activity_entity.go](file:///d:/fz/0601-1/solo-dogfeeding/code/63-answer/internal/entity/activity_entity.go) | L24-L63 |
 | 活动类型配置 | [activity_type.go](file:///d:/fz/0601-1/solo-dogfeeding/code/63-answer/internal/service/activity_type/activity_type.go) | L22-L76 |
 | 投票状态常量 | [acticity.go](file:///d:/fz/0601-1/solo-dogfeeding/code/63-answer/internal/base/constant/acticity.go) | L24-L40 |
+
+---
+
+## 十、事件总线与下游链路全景（SendEvent 之后）
+
+### 10.1 四条完全独立的异步队列
+
+系统中有**四条独立的内存队列**，各自承载不同的语义。它们共享同一个底层 `queue.Queue[T]` 泛型实现，但相互之间**没有任何关联**，消费者和发送者也不同：
+
+| 队列名 | 消息类型 | 容量 | 发送者 | 唯一消费者 | 核心用途 |
+|--------|----------|------|--------|------------|----------|
+| **eventqueue** | `*schema.EventMsg` | 128 | question/answer/comment/report/meta/user 服务 + VoteService | BadgeEventService | **徽章（Badge）解锁判定** |
+| **noticequeue(内部)** | `*schema.NotificationMsg` | 128 | NotificationCommon / BadgeAwardService / VoteRepo | NotificationCommon.AddNotification | **站内通知（Inbox + Achievement）** |
+| **noticequeue(外部)** | `*schema.ExternalNotificationMsg` | 128 | user_notification_config 等 | ExternalNotificationService.Handler | **邮件/第三方插件通知** |
+| **activityqueue** | `*schema.ActivityMsg` | 128 | question/answer/comment/revision/tag 服务 | ActivityCommon.HandleActivity | **非投票类活动时间线** |
+| **vector_sync** | `*Task` | 128 | question/answer/comment/review 服务 | vector_sync.handle（内置） | **向量搜索索引同步** |
+
+> **关键：投票不走 activityqueue**。投票类 Activity（`question.vote_up` 等）在 vote_repo.go 的事务中直接 INSERT，不经过异步队列。activityqueue 承载的是创建/编辑/关闭/删除等非投票行为。
+
+### 10.2 队列底层实现（单 Handler + 单 Worker）
+
+[queue.go](file:///d:/fz/0601-1/solo-dogfeeding/code/63-answer/internal/base/queue/queue.go) 的核心设计：
+
+**架构**：
+```
+                    ┌──────────────────────┐
+Send() → ──────→   │  chan T (buffer=128) │  ──────→ 单一 for-range goroutine
+                    └──────────────────────┘               │
+                                                           ▼
+                                              q.handler(msg)  单一函数
+```
+
+**关键性质**：
+
+1. **单 Handler 覆盖模型**：`RegisterHandler` 只是 `q.handler = handler` 的**赋值**，不是追加列表。后注册者会**覆盖**先注册者。因此每条队列**只能有一个消费者**。
+
+2. **单 Worker 顺序消费**：`startWorker()` 只起一个 goroutine，`for msg := range q.queue` 逐条取出处理。消息严格按入队顺序 FIFO 消费。
+
+3. **发送时阻塞**：`Send()` 使用 `select q.queue <- msg`，若缓冲满则阻塞等待（除非 ctx 取消）。背压机制 = 阻塞调用者线程。
+
+4. **进程内队列**：纯内存 channel，**无持久化**。进程崩溃或重启后，未消费消息**永久丢失**。
+
+5. **无自动重试**：`processMessage` 中 handler 返回 error 只会 `log.Errorf`，不会重入队列。
+
+---
+
+## 十一、投票 SendEvent 的精确下游
+
+### 11.1 SendEvent 发出了什么
+
+[VoteService.sendEvent](file:///d:/fz/0601-1/solo-dogfeeding/code/63-answer/internal/service/content/vote_service.go#L301-L323) 只在**非 Cancel 的正向投票**后调用（取消投票不发 EventMsg）：
+
+```go
+func (vs *VoteService) sendEvent(ctx, op, userID, authorUserID string) {
+    event := schema.NewEvent(constant.EventQuestionVote, userID)  // 默认 EventQuestionVote
+    if op == "answer" {
+        event.EventType = constant.EventAnswerVote
+    } else if op == "comment" {
+        event.EventType = constant.EventCommentVote
+    }
+    // ...填充 QuestionID/AnswerID/CommentID 和各自的 UserID
+    event.AddExtra("vote_up_amount", fmt.Sprintf("%d", upVotes))
+    vs.eventQueueService.Send(ctx, event)   // 只发到 eventqueue！
+}
+```
+
+**投票只发 eventqueue**，不直接发 noticequeue。通知的产生走另外两条路：
+- **站内成就通知**：在 vote_repo.go 的事务外通过 `achievementCommon.SendNotification`（声望变更通知）
+- **徽章解锁通知**：徽章解锁成功后 BadgeAwardService 自己发 noticequeue
+
+### 11.2 投票后的完整链路图
+
+```
+用户提交 UP 投票
+    │
+    ▼
+[Controller] 权限/验证码
+    │
+    ▼
+[VoteService.VoteUp]
+    ├─① voteRepo.CancelVote(down)        // 事务：撤反向票+回滚声望
+    ├─② voteRepo.Vote(up)                // 事务：写Activity+加声望
+    │    │
+    │    └─（事务外）SendNotification     // → noticequeue(内部): 声望成就通知
+    │
+    ├─③ voteRepo.GetAndSaveVoteResult    // vote_count 重算
+    └─④ sendEvent                         // → eventqueue: 投票事件（徽章判定）
+            │
+            ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                    异步消费（各队列独立）                        │
+│                                                                 │
+│  [eventqueue:BadgeEventService.Handler]                         │
+│    ├─ EventRuleMapping[EventQuestionVote] = [FirstVotedPost,    │
+│    │                                             ReachQuestionVote]│
+│    ├─ 若命中徽章条件:                                            │
+│    │   BadgeAwardService.Award()                                │
+│    │     ├─ CheckIsAward（防重复）                               │
+│    │     ├─ INSERT badge_award                                  │
+│    │     └─ Send NotificationMsg → noticequeue: 徽章成就通知    │
+│    └─ return nil  // 失败只打日志，不重试                        │
+│                                                                 │
+│  [noticequeue:NotificationCommon.AddNotification]               │
+│    ├─ 区分 Inbox(1) vs Achievement(2)                          │
+│    ├─ Achievement 去重：(user,object,type) 已存在则更新 rank    │
+│    ├─ INSERT notification 表                                    │
+│    ├─ Redis 红点计数 +1                                         │
+│    ├─ 徽章类型: AddBadgeAwardAlertCache                         │
+│    ├─ go SendNotificationToAllFollower()  // 广播给粉丝(新问答) │
+│    └─ syncNotificationToPlugin()  // 调 plugin.Notification     │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 十二、eventqueue 队列与徽章解锁
+
+### 12.1 注册与订阅关系
+
+**唯一订阅者**：[BadgeEventService](file:///d:/fz/0601-1/solo-dogfeeding/code/63-answer/internal/service/badge/badge_event_handler.go)
+```go
+// NewBadgeEventService 构造时:
+eventQueueService.RegisterHandler(n.Handler)  // 唯一一个 handler
+```
+
+### 12.2 Event → 徽章规则映射
+
+[badge_event_rule.go:L47-L68](file:///d:/fz/0601-1/solo-dogfeeding/code/63-answer/internal/repo/badge/badge_event_rule.go#L47-L68) 的 `EventRuleMapping` 定义：
+
+```go
+constant.EventQuestionVote:   {b.FirstVotedPost, b.ReachQuestionVote},
+constant.EventAnswerVote:     {b.FirstVotedPost, b.ReachAnswerVote},
+constant.EventCommentVote:    {b.FirstVotedPost},
+```
+
+投票事件触发三类徽章判定：
+
+| 规则处理器 | 判定逻辑 | 授予对象 | AwardKey（防复用键） |
+|-----------|----------|----------|---------------------|
+| **FirstVotedPost** | 读 DB `WHERE handler="FirstVotedPost"` 的所有徽章，无条件返回（Award 层再去重） | 投票人(event.UserID) | objectID（问题/回答/评论ID） |
+| **ReachQuestionVote** | 读 `vote_up_amount` Extra 值，若 ≥ `badge.param.amount` 则命中 | **作者**(event.QuestionUserID) | 问题ID |
+| **ReachAnswerVote** | 同上，针对回答 | **作者**(event.AnswerUserID) | 回答ID |
+
+### 12.3 Handler 执行流程
+
+[BadgeEventService.Handler](file:///d:/fz/0601-1/solo-dogfeeding/code/63-answer/internal/service/badge/badge_event_handler.go#L64-L77)：
+```
+步骤1: eventRuleRepo.HandleEventWithRule(msg)
+       → 遍历该 EventType 的所有规则处理器
+       → 每个处理器返回 []*BadgeAward{UserID, BadgeID, AwardKey}
+       → 聚合所有待授予
+
+步骤2: 遍历 awards:
+       badgeAwardService.Award(award.BadgeID, award.UserID, award.AwardKey)
+         ├─ badgeRepo.GetByID → 校验徽章存在且 Active
+         ├─ badgeAwardRepo.CheckIsAward(badgeID, userID, awardKey, badge.Single)
+         │    Single=1(一次性): 同用户同徽章只需 awardKey 任意
+         │    Single=0(多次性): 同用户同徽章需要 awardKey 唯一
+         │    → 已授予: return nil（幂等跳过）
+         ├─ INSERT badge_award 表
+         └─ noticequeue.Send(NotificationMsg{
+              Type=Achievement,
+              ObjectType=BadgeAwardObjectType,
+              NotificationAction=NotificationEarnedBadge
+            })  // 发成就通知
+
+步骤3: 任意处理器 error 只 log.Errorf，不中断其他处理器
+```
+
+### 12.4 消费失败语义
+
+- **handler 返回 error**：只 `log.Errorf("[%s] handler error: %v")`，消息**被丢弃**不重放
+- **Award() 返回 error**：每个 award 独立 `log.Debugf`，不影响其他徽章授予
+- **无死信队列**：没有 DLQ，失败后只能等待下一次同类事件触发再尝试
+
+---
+
+## 十三、noticequeue 队列与站内通知
+
+### 13.1 两条 noticequeue 的区分
+
+注意：`noticequeue` 包下有**两种不同的 Service 类型**，对应两条独立的 channel 队列：
+
+```go
+// 队列A: 站内通知(内部) —— buffer 128
+type Service queue.Service[*schema.NotificationMsg]
+func NewService() Service { return queue.New[*schema.NotificationMsg]("notification", 128) }
+
+// 队列B: 外部通知(邮件/插件) —— buffer 128
+type ExternalService queue.Service[*schema.ExternalNotificationMsg]
+func NewExternalService() ExternalService { return queue.New[*schema.ExternalNotificationMsg]("external_notification", 128) }
+```
+
+| 队列 | 注册者 | 注册位置 | Handler |
+|------|--------|----------|---------|
+| A(内部) | [NotificationCommon](file:///d:/fz/0601-1/solo-dogfeeding/code/63-answer/internal/service/notification_common/notification.go#L96) | `NewNotificationCommon` | `AddNotification` |
+| B(外部) | [ExternalNotificationService](file:///d:/fz/0601-1/solo-dogfeeding/code/63-answer/internal/service/notification/external_notification.go#L70) | `NewExternalNotificationService` | `.Handler`（邮件分发） |
+
+因为类型参数不同，两者的 RegisterHandler 互不干扰，不存在覆盖问题。
+
+### 13.2 AddNotification 内部执行流程
+
+[notification.go:L109-L220](file:///d:/fz/0601-1/solo-dogfeeding/code/63-answer/internal/service/notification_common/notification.go#L109-L220)，输入 `NotificationMsg{Type, TriggerUserID, ReceiverUserID, ObjectID, ObjectType, Title, NotificationAction, ...}`：
+
+```
+步骤1: 快速拦截
+  ├─ Type==Achievement && plugin.RankAgentEnabled() → return nil
+  └─ 获取 ObjectInfo（对象标题/问题ID/回答ID/评论ID的映射表）
+
+步骤2: 分类型处理
+  ┌─ Type==Achievement(声望类)
+  │    ① GetByUserIdObjectIdTypeId(user, object, type=2) 去重
+  │    ② GetUserIDObjectIDActivitySum(user, object) 重算 rank 累计
+  │    ③ 已存在: UPDATE notification.content.rank（同对象只留一条成就通知，更新累计值）
+  │    └─ 不存在: 继续步骤3
+  │
+  └─ Type==Inbox(消息类)
+       └─ 直接继续步骤3（不去重，每条都是独立消息）
+
+步骤3: 构造 Notification 实体并 INSERT
+  - UserID=ReceiverUserID, MsgType=NotificationMsgTypeMapping[Action]
+  - Content=JSON{UserInfo, ObjectInfo, Rank, NotificationAction, ...}
+  - IsRead=NotRead, Status=Normal
+
+步骤4: 红点系统
+  - Redis INCR key=`reddot:inbox:{userID}` 或 `reddot:achievement:{userID}`
+  - TTL=RedDotCacheTime（默认 180 天）
+  - 若 BadgeAward 类型：额外写 AddBadgeAwardAlertCache（Redis JSON 列表）
+
+步骤5: 异步扩展（不阻塞 handler）
+  - go SendNotificationToAllFollower():
+      仅限 Event=UpdateQuestion/AnswerQuestion/UpdateAnswer/AcceptAnswer
+      查询 follow 了该问题的所有用户 → 给每人 copy 一份 msg 重入 noticequeue
+      (NoNeedPushAllFollow=true 防止递归)
+  - syncNotificationToPlugin():
+      Type==Inbox 时，调用 plugin.CallNotification → 所有已注册插件的 fn.Notify()
+```
+
+### 13.3 成就通知 vs 站内收件箱的区别
+
+| 维度 | Inbox (Type=1) | Achievement (Type=2) |
+|------|----------------|----------------------|
+| 触发场景 | 有人回答/评论/编辑/采纳你的内容 | 你获得声望 / 你解锁徽章 |
+| 去重策略 | 不去重，每条独立 INSERT | `(user, object, type=2)` 唯一，存在就 UPDATE rank |
+| 发送者 | 所有内容变更场景 | vote_repo 声望通知 + BadgeAwardService 徽章通知 |
+
+---
+
+## 十四、搜索索引更新链路（重要：不走 eventqueue！）
+
+### 14.1 文本搜索索引（keyword search）
+
+**触发方式：repo 层直接同步调用 plugin，非异步队列**
+
+| 操作 | 触发位置 | 调用 |
+|------|----------|------|
+| 问题 CUD/状态变更/接受/置顶 | [question_repo.go](file:///d:/fz/0601-1/solo-dogfeeding/code/63-answer/internal/repo/question/question_repo.go) | `qr.UpdateSearch(ctx, questionID)` |
+| 回答 CUD/状态变更/接受 | [answer_repo.go](file:///d:/fz/0601-1/solo-dogfeeding/code/63-answer/internal/repo/answer/answer_repo.go) | `ar.updateSearch(ctx, answerID)` |
+| 问题通过审核 | [question_service.go:L415](file:///d:/fz/0601-1/solo-dogfeeding/code/63-answer/internal/service/content/question_service.go#L415) | `qs.questionRepo.UpdateSearch` |
+
+**投票不触发搜索索引重建！** `VoteService` 中没有任何 `UpdateSearch` 调用。问题/回答的 `vote_count`（搜索文档的 `Score` 字段）在投票后不会立即同步到搜索索引。
+
+**UpdateSearch 的内部实现**（[question_repo.go:L584-L634](file:///d:/fz/0601-1/solo-dogfeeding/code/63-answer/internal/repo/question/question_repo.go#L584-L634)）：
+```
+① plugin.CallSearch → 检查是否注册了 Search 插件，未注册直接 return
+② DB 重新读取问题/回答全文 + tags + 最新 VoteCount / AnswerCount / ViewCount ...
+③ s.UpdateContent(ctx, &plugin.SearchContent{Score=question.VoteCount, ...})
+   → 由具体插件实现（meilisearch/typesense/algolia 等）的 upsert 逻辑
+```
+
+### 14.2 向量搜索索引（embedding / semantic search）
+
+**触发方式：独立 vector_sync 异步队列**
+
+[vector_sync.go](file:///d:/fz/0601-1/solo-dogfeeding/code/63-answer/internal/service/vector_sync/vector_sync.go) 队列：
+```go
+q := queue.New[*Task]("vector_sync", 128)
+q.RegisterHandler(func(ctx, msg) error {
+    // 3次重试（vector_sync 是唯一实现重试逻辑的队列！）
+    for attempt := 1; attempt <= 3; attempt++ {
+        handleOnce(upsert/delete, question/answer, objectID)
+            → BuildQuestion/AnswerContentByID → 重新读DB生成向量
+            → vectorSearch.UpdateContent / DeleteContent
+    }
+    return lastErr  // 3次都失败才记录 error log
+})
+```
+
+**同样，投票不触发向量索引同步**。只有内容 CUD/审核流转才 Send 到 vector_sync。
+
+### 14.3 投票导致的 Score 滞后
+
+投票后 DB 中 `question.vote_count` 已是新值，但：
+- **文本搜索 Score** 落后 → 下次创建/编辑/审核触发时才刷新
+- **向量搜索 Score** 同样落后 → 下次内容变更才重建
+
+这是有意的设计权衡（性能优先），若需强一致需要在 VoteService 末尾手动追加 `UpdateSearch` 和 `vectorSyncService.Send`。
+
+---
+
+## 十五、消费顺序与失败回退机制
+
+### 15.1 投票成功后的实际执行顺序
+
+以一次「对回答投 UP，之前是 Down 票」为例，从 VoteService 层看：
+
+```
+同步阶段（HTTP 请求线程内，强顺序保证）:
+ T1: voteRepo.CancelVote(down)
+       ├─ 事务: BEGIN → ForUpdate 锁用户 → soft-delete Activities
+       │            → 回滚 User.rank → COMMIT
+       └─（事务外）achievementCommon.SendNotification → 入队 noticequeue
+
+ T2: voteRepo.Vote(up)
+       ├─ 事务: BEGIN → ForUpdate 锁用户 → saveActivities
+       │            → 加 User.rank → COMMIT
+       └─（事务外）achievementCommon.SendNotification → 入队 noticequeue
+
+ T3: voteRepo.GetAndSaveVoteResult → UPDATE answer SET vote_count=?
+ T4: vs.sendEvent → 入队 eventqueue
+
+─────────────────────────────────────────────────────
+
+异步阶段（各队列 goroutine 内，**顺序不可控**）:
+  ▲ goroutine A(eventqueue):  处理 EventAnswerVote
+  │                            → FirstVotedPost / ReachAnswerVote
+  │                            → 若命中徽章 → Award → 入队 noticequeue
+  │
+  ▲ goroutine B(noticequeue): 处理 T1 的通知（撤销 Down 的成就通知）
+  │                            → INSERT / UPDATE notification 表 + 红点
+  ▲ goroutine B(noticequeue): 处理 T2 的通知（投 UP 的声望通知）
+  ▲ goroutine B(noticequeue): 若已有徽章解锁通知 → 处理徽章成就通知
+
+  注意：因为 eventqueue 和 noticequeue 是**两个独立 goroutine**，
+       徽章入队 noticequeue 的时机相对于 T1/T2 的通知是**不可预测**的，
+       可能插入到任意位置。
+```
+
+### 15.2 失败回退机制总结
+
+| 层级 | 失败场景 | 回退/重试策略 |
+|------|----------|---------------|
+| **vote_repo 事务** | 任一步骤 error | 事务 ROLLBACK，活动记录 + 声望都不生效，HTTP 返回错误 |
+| **GetAndSaveVoteResult** | DB 更新 vote_count 失败 | VoteService 直接返回 error 给前端（前面事务已提交，**不会回滚活动和声望**。vote_count 可被下次投票修复） |
+| **SendEvent / SendNotification** | channel 满阻塞 | 阻塞 HTTP 线程（背压）；ctx 取消则丢弃消息 |
+| **eventqueue handler** | 徽章判定/授予 error | 仅 log，消息丢弃，不重试。下次同类型事件可再次触发同样规则 |
+| **noticequeue AddNotification** | INSERT notification / Redis 红点失败 | handler 返回 error → log，消息丢弃。红点可能少加 1（用户实际会看到有新通知但红点为0，下次进入列表时修正） |
+| **vector_sync handler** | 向量更新失败 | **重试 3 次**，仍失败则 log，消息丢弃 |
+| **SendNotificationToAllFollower** | goroutine 内的 DB/入队失败 | log.Error，该部分粉丝收不到通知，无补偿 |
+
+### 15.3 关键幂等性保证
+
+| 操作 | 幂等机制 |
+|------|----------|
+| 活动记录去重 | `(object_id, user_id, trigger_user_id, activity_type)` + Cancelled 状态机 |
+| 声望增减 | Activity 存了 Rank 值，去重时复用；ChangeUserRank 仅对 Rank≠0 的生效 |
+| 徽章授予 | `CheckIsAward(badgeID, userID, awardKey, Single)`：一次性徽章 user 唯一，多次性 awardKey 唯一 |
+| 成就通知去重 | `GetByUserIdObjectIdTypeId(user, object, type=2)`：同用户同对象只有一条 Achievement 通知，已有则 UPDATE rank 累加值 |
+| 投票计数 | 每次全量 COUNT(*)，天然幂等 |
+
+---
+
+## 十六、完整链路时序图（一次 UP 投票切换）
+
+```
+  Client                VoteService           VoteRepo            eventqueue         noticequeue
+    │  POST /vote/up       │                     │                    │                   │
+    │─────────────────────>│                     │                    │                   │
+    │                      │  CancelVote(down)   │                    │                   │
+    │                      │────────────────────>│  事务(回滚声望)     │                   │
+    │                      │                     │──────┐             │                   │
+    │                      │                     │ COMMIT│             │                   │
+    │                      │                     │<─────┘             │                   │
+    │                      │                     │  SendNotif(ach)    │                   │
+    │                      │                     │───────────────────────────────────────>│
+    │                      │  Vote(up)           │                    │                   │
+    │                      │────────────────────>│  事务(写活动+加声望)│                   │
+    │                      │                     │──────┐             │                   │
+    │                      │                     │ COMMIT│             │                   │
+    │                      │                     │<─────┘             │                   │
+    │                      │                     │  SendNotif(ach)    │                   │
+    │                      │                     │───────────────────────────────────────>│
+    │                      │                     │                    │                   │
+    │                      │ GetAndSaveVoteResult│                    │                   │
+    │                      │────────────────────>│  COUNT + UPDATE    │                   │
+    │                      │<────────────────────│                    │                   │
+    │                      │  SendEvent          │                    │                   │
+    │                      │────────────────────────────────────────>│                   │
+    │<─────────────────────│                     │                    │                   │
+    │  200 OK {vote_count} │                     │                    │                   │
+    │                      │                     │                    │                   │
+    │ ══════════════════════════════════════════════════════════════════════════════════════
+    │ 以下全是异步消费 goroutine，客户端不可见                                           │
+    │                      │                     │  BadgeHandler       │  AddNotification  │
+    │                      │                     │  徽章规则匹配        │  成就通知入库     │
+    │                      │                     │  → Award徽章        │  Redis红点+1      │
+    │                      │                     │  → 发成就通知─────────────────────────>│
+    │                      │                     │                    │  徽章成就入库     │
+```
+
+---
+
+## 十七、下游链路代码索引
+
+| 关注点 | 文件 | 关键行 |
+|--------|------|--------|
+| 队列底层实现 | [queue.go](file:///d:/fz/0601-1/solo-dogfeeding/code/63-answer/internal/base/queue/queue.go) | L29-L130 |
+| eventqueue 定义 | [event_queue.go](file:///d:/fz/0601-1/solo-dogfeeding/code/63-answer/internal/service/eventqueue/event_queue.go) | L27-L31 |
+| 徽章事件处理 | [badge_event_handler.go](file:///d:/fz/0601-1/solo-dogfeeding/code/63-answer/internal/service/badge/badge_event_handler.go) | L32-L77 |
+| Event→徽章规则映射 | [badge_event_rule.go](file:///d:/fz/0601-1/solo-dogfeeding/code/63-answer/internal/repo/badge/badge_event_rule.go) | L37-L85, L196-L236 |
+| 徽章授予(含去重) | [badge_award_service.go](file:///d:/fz/0601-1/solo-dogfeeding/code/63-answer/internal/service/badge/badge_award_service.go) | L148-L191 |
+| 投票 SendEvent | [vote_service.go](file:///d:/fz/0601-1/solo-dogfeeding/code/63-answer/internal/service/content/vote_service.go) | L301-L323 |
+| 站内通知队列定义 | [notice_queue.go](file:///d:/fz/0601-1/solo-dogfeeding/code/63-answer/internal/service/noticequeue/notice_queue.go) | L27-L37 |
+| AddNotification 逻辑 | [notification.go](file:///d:/fz/0601-1/solo-dogfeeding/code/63-answer/internal/service/notification_common/notification.go) | L109-L220, L222-L244 |
+| 外部通知(邮件) | [external_notification.go](file:///d:/fz/0601-1/solo-dogfeeding/code/63-answer/internal/service/notification/external_notification.go) | L39-L97 |
+| 文本搜索同步(问题) | [question_repo.go](file:///d:/fz/0601-1/solo-dogfeeding/code/63-answer/internal/repo/question/question_repo.go) | L584-L634 |
+| 文本搜索同步(回答) | [answer_repo.go](file:///d:/fz/0601-1/solo-dogfeeding/code/63-answer/internal/repo/answer/answer_repo.go) | L463-L529 |
+| 向量搜索同步(含重试) | [vector_sync.go](file:///d:/fz/0601-1/solo-dogfeeding/code/63-answer/internal/service/vector_sync/vector_sync.go) | L51-L115 |
+| Activity 队列消费 | [activity.go](file:///d:/fz/0601-1/solo-dogfeeding/code/63-answer/internal/service/activity_common/activity.go) | L50-L91 |
+| EventMsg 结构 | [event_schema.go](file:///d:/fz/0601-1/solo-dogfeeding/code/63-answer/internal/schema/event_schema.go) | L27-L114 |
+| NotificationMsg 结构 | [notification_schema.go](file:///d:/fz/0601-1/solo-dogfeeding/code/63-answer/internal/schema/notification_schema.go) | L75-L95 |
+| 事件类型常量 | [event.go](file:///d:/fz/0601-1/solo-dogfeeding/code/63-answer/internal/base/constant/event.go) | L24-L56 |
+| 通知动作常量 | [notification.go](file:///d:/fz/0601-1/solo-dogfeeding/code/63-answer/internal/base/constant/notification.go) | L24-L46 |
