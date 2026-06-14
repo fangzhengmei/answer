@@ -2233,3 +2233,335 @@ docker run -d -p 9080:80 -v /data/answer:/data \
 - `config.yaml` 可以被版本控制，环境间复制
 - 运行时配置通过管理后台修改，无需重启服务
 - 敏感信息（DB 密码）可以通过环境变量注入，不落盘
+
+---
+
+## 十八、Migration 单步幂等性：InitDB 26 次 m.do 与 Upgrade 增量循环的去重机制
+
+### 18.1 幂等性的三层设计
+
+整个 Answer 系统在迁移/安装层面实现了三级幂等防护，确保**任何一步重复执行都不会产生脏数据**：
+
+| 层级 | 机制 | 覆盖范围 | 代码位置 |
+|------|------|---------|---------|
+| L1 全局级 | `checkTableExist` → `Done` 标志 | 阻断整次 InitDB 全部 26 步 | [init.go](file:///d:/fz/0601-1/solo-dogfeeding/code/70-answer/internal/migrations/init.go#L95-L109) |
+| L2 循环级 | `version_number` 已递增 → 跳过已执行迁移 | 阻断 upgrade 单步迁移的重入 | [migrations.go](file:///d:/fz/0601-1/solo-dogfeeding/code/70-answer/internal/migrations/migrations.go#L144-L198) |
+| L3 行级 | `SELECT ... Get(condition)` → `exist? Update/skip : Insert` | 每条 roles/powers/role_power_rel 行的幂等 | 所有 v4/v8/v13/v17 迁移脚本 |
+
+### 18.2 InitDB 中 26 次 m.do 的四种幂等策略
+
+[Mentor.do()](file:///d:/fz/0601-1/solo-dogfeeding/code/70-answer/internal/migrations/init.go#L95-L103) 先检查 L1 的 `m.Done` 和 `m.err`，然后才执行函数。26 次调用内部的实际幂等策略分为四类：
+
+| 幂等策略 | 适用步骤（#） | 实际机制 | 重复执行结果 |
+|---------|--------------|---------|------------|
+| **L1 Done 标志** | 所有 26 步 | `checkTableExist` → 发现 `version` 表存在 → `Done=true` → `m.do()` 直接 return | 全部跳过，零副作用 |
+| **批量 Insert（无检查）** | #2 syncTable, #4 initAdminUser, #5 initConfig, #6 initDefaultRankPrivileges, #7 initRole, #8 initPower, #9 initRolePowerRel, #10 initAdminUserRoleRel, #11-#22 所有 SiteInfo Insert, #23-#26 初始化内容 | 直接 `engine.Insert()` | **⚠️ 首次执行才安全**——若 L1 Done 失效则 Insert 重复主键会报错（但 L1 确保不会发生） |
+| **Update 条件匹配** | #6 initDefaultRankPrivileges | `Update(..., {Key: privilege.Key})` WHERE key=xxx | 幂等：重复 Update 为同值 |
+| **Sync 表结构** | #2 syncTable | xorm `Sync()` 内部检查列是否存在 | 幂等：已存在的字段/索引跳过 |
+
+**关键洞察**：InitDB 的大部分步骤（角色/权限/SiteInfo/内容）本身 **并没有行级去重**——它们依赖外层 L1 的 Done 标志作为唯一的幂等保证。这种设计选择的原因是：
+1. 首次安装场景下 Done=false → 所有表都是空的，Insert 不会冲突
+2. Done=true（由 checkTableExist 检测 version 表）→ 所有 26 步一次性跳过，无需每行检查
+3. 相比每行都做 SELECT+INSERT，**单次表存在性检测** 在首次安装场景下性能最优（少了 3+41+83+1+N 次额外 SELECT）
+
+### 18.3 Upgrade 迁移脚本的行级去重模式（以 v4/v8/v13/v17 为例）
+
+与 InitDB 不同，Upgrade 的每个迁移脚本必须**自带行级幂等**——因为 `-f v1.1.0` 参数可能从历史版本重复执行，或迁移失败回滚后重跑。
+
+#### v4.go 新增角色权限功能：三表全量 Upsert
+
+[v4.go `addRoleFeatures()`](file:///d:/fz/0601-1/solo-dogfeeding/code/70-answer/internal/migrations/v4.go#L32-L234) 是最完整的幂等样板：
+
+```go
+// ========== role 表：INSERT前先 GET ==========
+for _, role := range roles {
+    exist, _ := x.Get(&entity.Role{ID: role.ID, Name: role.Name})  // 条件：ID+Name 双匹配
+    if exist { continue }                                           // 已存在→跳过
+    x.Insert(role)                                                  // 不存在→插入
+}
+
+// ========== power 表：Upsert 模式（存在→Update，不存在→Insert） ==========
+for _, power := range powers {
+    exist, _ := x.Get(&entity.Power{ID: power.ID})                // 条件：ID 匹配
+    if exist {
+        x.ID(power.ID).Update(power)                              // 已存在→覆盖更新（允许描述变更）
+    } else {
+        x.Insert(power)                                            // 不存在→插入
+    }
+}
+
+// ========== role_power_rel 表：INSERT前先 GET ==========
+for _, rel := range rolePowerRels {
+    exist, _ := x.Get(&entity.RolePowerRel{RoleID: rel.RoleID, PowerType: rel.PowerType})  // 联合主键
+    if exist { continue }
+    x.Insert(rel)
+}
+
+// ========== user_role_rel 表：INSERT前先 GET ==========
+exist, _ := x.Get(adminUserRoleRel)
+if !exist { x.Insert(adminUserRoleRel) }
+
+// ========== config 表：Upsert 模式 ==========
+for _, c := range defaultConfigTable {
+    exist, _ := x.Get(&entity.Config{ID: c.ID, Key: c.Key})
+    if exist { x.Update(c, &entity.Config{ID: c.ID, Key: c.Key}); continue }
+    x.Insert(c)
+}
+```
+
+**三种去重模式的设计意图**：
+
+| 模式 | 适用表 | 理由 |
+|------|-------|------|
+| **Get → Skip/Insert** | role, role_power_rel, user_role_rel | 业务主键稳定且不会被用户修改 → 存在即正确 |
+| **Get → Update/Insert（Upsert）** | power, config | 版本升级时可能需要更新描述/默认值 → 存在则覆盖 |
+| **仅 Upsert（无显式 Skip）** | power 描述变更 | 支持后续版本修正权限的 Description 文本 |
+
+#### v8.go 新增 Pin/Hide 功能：增量添加 4 个权限 + 8 条关联
+
+[v8.go `addRolePinAndHideFeatures()`](file:///d:/fz/0601-1/solo-dogfeeding/code/70-answer/internal/migrations/v8.go#L33-L82) 的幂等模式完全镜像 v4：
+```
+powers (ID 34-37):   Get{ID} → exist? Update : Insert
+rolePowerRels (4×2): Get{RoleID, PowerType} → exist? skip : Insert
+config (ID 119-126): Get{ID} → exist? Update : Insert
+```
+
+**注意：只处理本版本增量添加的 ID 范围**（34-37 而非 1-41），避免覆盖早期版本已存在的其他权限。
+
+#### v13.go 新增 Invite/Gravatar 功能：部分 Upsert + 计数重算
+
+[v13.go `addPrivilegeForInviteSomeoneToAnswer()`](file:///d:/fz/0601-1/solo-dogfeeding/code/70-answer/internal/migrations/v13.go#L80-L136) 的幂等模式：
+```
+powers (ID 38):        Get{PowerType} → Upsert（按 PowerType 查而非 ID，兼容早期数据可能缺 ID=38）
+rolePowerRels (2):     Get{RoleID, PowerType} → Skip/Insert
+config (ID 127):       Get{ID} → Upsert
+```
+
+**特殊点**：power 用 `Get(&entity.Power{PowerType: ...})` 而非按 ID 查询。这是容错设计——如果某用户的 power 表中 ID=38 被误删但 PowerType 仍存在于其他 ID，仍然能正确匹配到已有行。
+
+v13.go 中另一类操作是 `updateQuestionCount/updateTagCount/...`：它们全部使用 Find → 遍历 → `Update(..., WHERE ID=x)` 的模式，天然幂等（重算结果相同）。
+
+#### v17.go 新增 Recover 功能：与 v8 完全同构
+
+[v17.go `addRecoverPermission()`](file:///d:/fz/0601-1/solo-dogfeeding/code/70-answer/internal/migrations/v17.go#L32-L98) 与 v8 模式一致：
+```
+powers (ID 39-41):  Get{ID} → Upsert
+rolePowerRels (6):  Get{RoleID, PowerType} → Skip/Insert
+config (ID 128-130): Get{ID} → Upsert
+```
+
+### 18.4 不重写 3 roles + 41 powers + 83 role_power_rel 的完整保证矩阵
+
+| 机制 | 防止 roles 重复 | 防止 powers 重复 | 防止 role_power_rel 重复 |
+|------|---------------|----------------|------------------------|
+| **InitDB：checkTableExist（L1）** | ✅ version 表存在则全部跳过 | ✅ 同上 | ✅ 同上 |
+| **InitDB：Insert 批量（无检查）** | ❌ 单独重复会主键冲突（但 L1 阻止） | ❌ 同上 | ❌ 同上 |
+| **Upgrade v4：Get+Skip/Insert** | ✅ 按 {ID,Name} 存在性跳过 | ✅ 按 ID Upsert | ✅ 按 {RoleID,PowerType} 跳过 |
+| **Upgrade v8/v17：增量 Upsert** | 无涉及 | ✅ 只处理增量 ID | ✅ 只处理增量关联 |
+| **Upgrade v13：按 PowerType 查** | 无涉及 | ✅ 按业务键匹配（更健壮） | ✅ 按联合键跳过 |
+| **Upgrade Migrate() 版本号** | ✅ N→32 只跑一次增量循环 | ✅ 同上 | ✅ 同上 |
+
+**设计权衡总结**：
+- **InitDB 走 "批量 Insert + L1 Done 守护"**：追求首次安装性能（最少的 SELECT）
+- **Upgrade 走 "每行 Get+Insert/Upsert + L2 版本号守护"**：追求重复执行的安全性
+- 两者在 `v4.go addRoleFeatures` 交汇——v4 既是升级时的增量迁移，也是 InitDB 中 41 权限设计的来源
+
+---
+
+## 十九、安装中途断电后五道防线接住 SiteInfo 默认值与角色权限矩阵
+
+### 19.1 安装流程的 5 个易断电时间点
+
+[InitBaseInfo()](file:///d:/fz/0601-1/solo-dogfeeding/code/70-answer/internal/install/install_controller.go#L211-L249) → `Mentor.InitDB()` 的 26 步执行期间，任何时刻断电都可能导致部分写入。按时间顺序分为 5 个关键易断点：
+
+```
+POST /installation/base-info 到达
+       │
+       ├─ T0: 配置文件已创建（#13.3 InitEnvironment 完成）
+       │      但 DB 连接尚未初始化
+       │      └── 断点 A
+       │
+       ├─ NewDB() + NewMentor() 完成
+       │
+       ├─ #1 checkTableExist → Done=false（表不存在）
+       ├─ #2 syncTable 创建所有表结构
+       │      └── 断点 B：表存在但完全没有数据
+       │
+       ├─ #3 initVersionTable（写入 version_number=32） ← L1 Done 标志触发点
+       │      └── 断点 C：version 表已写入，其他表为空
+       │
+       ├─ #4 initAdminUser
+       ├─ #5 initConfig（100+ 条 rank.* 配置）
+       ├─ #6 initDefaultRankPrivileges
+       ├─ #7 initRole（3 条角色）
+       ├─ #8 initPower（41 条权限）
+       ├─ #9 initRolePowerRel（83 条关联）
+       │      └── 断点 D：部分角色/权限矩阵写入，version 已完成
+       │
+       ├─ #10 initAdminUserRoleRel（用户1绑定Admin）
+       ├─ #11-#22 12 条 SiteInfo 行插入（interface/general/login/theme/seo/...）
+       ├─ #23 initDefaultContent（2问题+2回答+4标签）
+       │      └── 断点 E：示例内容不完整，但核心配置已就绪
+       │
+       └─ #24-#26 Badges/AI/MCP 完成 → InitDB 返回
+              time.Sleep(1s) → os.Exit(0)
+```
+
+### 19.2 五道防线的完整覆盖
+
+针对上述 5 类断点，系统构筑了 **五道递进式防线**，每一道覆盖上一道的漏检场景：
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│  防线 1：InitBaseInfo 入口 CheckDBTableExist 检查                  │
+│  代码：install_controller.go L225-L229                            │
+│  触发：用户再次打开浏览器 → 重新提交 base-info POST                │
+│  判断：version 表是否存在？                                        │
+│  是 → "database is already initialized" → 静默成功返回            │
+│  否 → 继续执行 Mentor.InitDB()                                    │
+└───────────────────────────┬──────────────────────────────────────┘
+                            │ 覆盖断点 A（表完全不存在）
+                            ▼
+┌──────────────────────────────────────────────────────────────────┐
+│  防线 2：Mentor.InitDB L1 Done 标志（checkTableExist）             │
+│  代码：init.go L105-L109                                          │
+│  触发：防线 1 放行了 InitDB 调用                                   │
+│  判断：IsTableExist(&entity.Version{}) ?                          │
+│  Done=true → 全部 26 个 m.do 一次性跳过（m.err/m.Done 检查）      │
+│  覆盖：断点 B、C（version 表已存在，其他表空或部分有数据）         │
+└───────────────────────────┬──────────────────────────────────────┘
+                            │ 覆盖断点 B/C/D/E
+                            ▼
+┌──────────────────────────────────────────────────────────────────┐
+│  防线 3：answer run 启动时的 answer upgrade 自动执行              │
+│  代码：Docker entrypoint.sh L2 → command.go L146-170              │
+│  触发：用户重启容器/手动执行 answer upgrade                       │
+│  判断：GetCurrentDBVersion() vs ExpectedVersion()                 │
+│  当前=32，期望=32 → 循环跳过，0 次迁移                            │
+│  当前=N<32 → 从 N 开始逐版本执行迁移脚本                          │
+└───────────────────────────┬──────────────────────────────────────┘
+                            │ 升级场景覆盖
+                            ▼
+┌──────────────────────────────────────────────────────────────────┐
+│  防线 4：v4.go addRoleFeatures 的行级 Upsert 补全                 │
+│  代码：v4.go L32-L234                                             │
+│  触发：防线 3 进入了某迁移版本的 Migrate()                         │
+│  判断：Get{ID,Name} / Get{ID} / Get{RoleID,PowerType}             │
+│  存在 → Skip 或 Update                                            │
+│  不存在 → Insert                                                  │
+└───────────────────────────┬──────────────────────────────────────┘
+                            │ 增量迁移的行级补全
+                            ▼
+┌──────────────────────────────────────────────────────────────────┐
+│  防线 5：运行时 SiteInfo Get 的空值兜底 + Admin Update 接口可写    │
+│  代码：siteinfo_service.go 各 Get 方法 + Update* 端点             │
+│  触发：服务正常启动，用户访问前台或管理后台                         │
+│  判断：GetByType(type) 有数据吗？                                  │
+│  有 → 返回存储值                                                  │
+│  无 → 返回默认值（GetSiteInfo 中通过 switch/case 构造空结构）      │
+│  管理员可进入 /admin 手动保存任意缺失配置                          │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+### 19.3 五道防线逐个断点的接住效果
+
+| 断点 | 发生时机 | 数据状态 | 第1道（CheckDBTableExist） | 第2道（Done） | 第3道（upgrade） | 第4道（v4 Upsert） | 第5道（运行时兜底） | 最终结果 |
+|------|---------|---------|--------------------------|-------------|----------------|------------------|-------------------|---------|
+| **A** | InitEnvironment 后，DB 初始化前 | config.yaml 存在，DB 空/表不存在 | DBTableExist=false → 放行 InitDB | 不触发（无 version 表） | 0 次迁移 | 不触发 | N/A | **InitDB 从头执行，完全恢复** ✅ |
+| **B** | syncTable 后，version 表创建前 | 所有表存在但全空 | DBTableExist=false → 放行 | checkTableExist=false → 26 步全走 | 0 次迁移 | 不触发 | N/A | **InitDB 从头 Insert 无冲突** ✅ |
+| **C** | initVersionTable 刚完成 | version=32，其他表空 | DBTableExist=true → 静默返回 | Done=true → 26 步全跳过 | 当前=32→0 迁移 | 不触发 | SiteInfo 为空→返回默认值；**但 Role/Power 全空导致管理员登录后无权限** ❌ → 需要手动恢复 | **有瑕疵！Role/Power 缺失需用 upgrade -f 触发 v4 修复** ⚠️ |
+| **D** | role_power_rel 写入中途 | version=32，role(3条)/power(41条)/部分 rel 存在 | DBTableExist=true → 静默返回 | Done=true → 跳过 | 0 次迁移 | 不触发 | 已存在的权限正常；**缺失的关联项导致管理员无该权限** ❌ | **有瑕疵！role_power_rel 部分缺失用 upgrade -f v1.1.0（v4）触发补全** ⚠️ |
+| **E** | 23 条默认内容写入中途 | version=32，核心配置全，仅 badges/AI/MCP/内容不全 | DBTableExist=true → 静默返回 | Done=true → 跳过 | 0 次迁移 | 不触发 | AI 配置为空→默认 disabled；Badges 为空→不展示；示例内容缺一部分 | **功能不受影响，可在后台补全** ✅ |
+
+### 19.4 断点 C 和 D 的手动恢复路径
+
+对于 **断点 C（version 表已写入但 role/power 完全空）** 和 **断点 D（role_power_rel 部分缺失）**，五道防线的第 2 道（Done=true）反而阻碍了自动恢复。需要使用 `-f` 参数降级版本号，强制触发 v4.go 的 Upsert：
+
+```bash
+# 断点 C 恢复：强制从 v4（也就是角色权限功能引入版本）开始重跑
+answer upgrade -C /data/ -f v1.1.0
+
+# 断点 D 恢复：同样强制 v4 重新执行，其 Get+Upsert 会补全缺失的 role_power_rel
+answer upgrade -C /data/ -f v1.1.0
+```
+
+**v4.go 补全断点 C 的实际执行流**：
+
+```
+GetCurrentDBVersion() 返回 32
+    ↓
+-f v1.1.0 → currentDBVersion = 3（假设 v4 对应 migrations[3]）
+    ↓
+for N=3; N<32; N++:
+    N=3: v4.addRoleFeatures()
+         ├── role(3) → Get{ID,Name} 不存在 → Insert 3 条 ✅
+         ├── power(41) → Get{ID} 不存在 → Insert 41 条 ✅
+         ├── role_power_rel(83) → Get{RoleID,PT} 不存在 → Insert 83 条 ✅
+         ├── user_role_rel(1) → Get 不存在 → Insert ✅
+         └── config(ID 115-117) → Upsert（已存在则不影响其他 config）
+    N=4..31: 依次执行 v5 到最新版（它们也有行级 Upsert）
+         └── 幂等性保证不会产生脏数据
+```
+
+### 19.5 防线 5：运行时 SiteInfo 空值兜底的实现细节
+
+当 SiteInfo 某一行缺失（断电在 #11-#22 之间），Service 层通过 "GetByType → 无则返回空结构体 + 默认值" 模式兜底，用户不会遇到 500 错误。管理员登录后台后重新保存对应页面即可把缺失的行补回数据库。
+
+例如 [GetSiteInterfaceSetting](file:///d:/fz/0601-1/solo-dogfeeding/code/70-answer/internal/service/siteinfo_service.go) 的逻辑：
+
+```go
+func (s *SiteInfoService) GetSiteInterfaceSetting(ctx context.Context) (*schema.SiteInterfaceResp, error) {
+    siteInfo, err := s.SiteInfoRepo.GetByType(ctx, constant.SiteTypeInterface)
+    if err != nil {
+        return nil, err
+    }
+    // 数据库中不存在这一行？返回空结构但不报错
+    if siteInfo == nil {
+        return &schema.SiteInterfaceResp{}, nil
+    }
+    resp := &schema.SiteInterfaceResp{}
+    // unmarshal Content...
+    return resp, nil
+}
+```
+
+前端 SchemaForm 渲染时，若拿到空响应则使用 `initFormData` 生成 JSONSchema 默认值（`language=en_US` 等）。管理员点击保存时，`UpdateInterface` → 最终 `SaveSiteInterface` 会执行 **Insert（第一次写入）或 Update（后续修改）** 的二选一逻辑（service 层内部判断是否已有对应 type 行）。
+
+---
+
+## 二十、InitDB 与 Upgrade 的交叉场景：从"已部分安装"状态的完整恢复
+
+### 20.1 三种典型交叉场景
+
+| 场景 | 触发条件 | 推荐恢复命令 | 预期结果 |
+|------|---------|------------|---------|
+| 场景 1：新安装完全成功 | 正常走完 26 步 | 无需操作 | version=32，数据完整 ✅ |
+| 场景 2：断点 B（表存在无数据） | syncTable 后断电 | `answer init -C ./data` | CheckDBTableExist=false → 重走 InitDB → 成功 ✅ |
+| 场景 3：断点 C（version 存在其他空） | initVersionTable 后断电 | `answer upgrade -C ./data -f v1.1.0` | 降级后 v4 补全 roles/powers ✅ |
+| 场景 4：断点 D（权限矩阵不全） | role_power_rel 写入中途断电 | `answer upgrade -C ./data -f v1.1.0` | v4 的 Get+Skip/Insert 补全缺失行 ✅ |
+| 场景 5：正常升级 32→33 | 新版 Answer ExpectedVersion=33 | `answer upgrade -C ./data` | 从 32 开始执行 migrations[32] ✅ |
+| 场景 6：升级 32→33 失败回滚 | migrations[32] 中途失败后修复 | `answer upgrade -C ./data` | version 仍=32 → 从 migrations[32] 重新开始 ✅ |
+
+### 20.2 InitDB 与 Upgrade 幂等设计的对照总结
+
+| 维度 | Mentor.InitDB（首次安装） | migrations.Migrate()（版本升级） |
+|------|--------------------------|-------------------------------|
+| **全局幂等守护** | `checkTableExist` → Done 标志（基于 version 表存在性） | `version_number` 逐次递增（基于 version.id=1 的数值） |
+| **行级幂等** | 无（依赖 Done 标志 + 空表） | 每行 Get→Skip/Upsert |
+| **roles/powers 去重** | Done=true 时全部跳过 | v4.go 的 Get+Skip/Insert 模式 |
+| **SiteInfo 去重** | Done=true 时全部跳过 | v13 等版本的 UPDATE（重算时天然幂等） |
+| **重复执行的最坏开销** | 1 次 IsTableExist 查询 | N 次 Get（N=当前版本已有的迁移脚本数） |
+| **从"部分成功"恢复** | Done 标志阻断 → 需用 `-f` 强制触发 Upgrade | 版本号未递增 → 下次自动重跑 |
+| **写入冲突处理** | L1 Done=全部跳过 → 无冲突 | Get→存在则 Skip/Update → 无冲突 |
+
+**核心设计原则**：
+- **InitDB = 粗粒度一次性操作**，依赖"version 表是否存在"这个强信号来判断是否已安装
+- **Upgrade = 细粒度增量操作**，每个迁移脚本自行保证行级幂等，支持断点续跑
+- 两者通过 `-f` 参数桥接——当 InitDB 的"全有或全无"模式在部分写入后失效时，切换到 Upgrade 模式利用每行 Upsert 做补全
+
+**注意**：站点运行时配置（SiteName、SMTP、主题等）**不存储在 config.yaml**，而是存储在数据库 `site_info` 表中。`config.yaml` 仅存储系统启动必需的基础配置（DB 连接、监听端口、缓存路径等）。
+
+这种分层设计的好处是：
+- `config.yaml` 可以被版本控制，环境间复制
+- 运行时配置通过管理后台修改，无需重启服务
+- 敏感信息（DB 密码）可以通过环境变量注入，不落盘
