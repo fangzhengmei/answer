@@ -586,18 +586,33 @@ func (req *QuestionAdd) Check() (errFields []*validator.FormErrorField, err erro
 1. `handler.BindAndCheckReturnErr(ctx, req)` → [handler.go](file:///d:/fz/0601-1/solo-dogfeeding/code/61-answer/internal/base/handler/handler.go#L63-L78)
 2. 内部调用 `validator.GetValidatorByLang(lang).Check(data)` → [validator.go](file:///d:/fz/0601-1/solo-dogfeeding/code/61-answer/internal/base/validator/validator.go#L190-L257)
 3. `Check()` 方法先执行 `m.Validate.Struct(value)` 做结构化校验
-4. **然后**检测 value 是否实现 `Checker` 接口（第 244 行）：
-   ```go
-   if v, ok := value.(Checker); ok {
-       errFields, err = v.Check()    // ← 在此处调用 QuestionAdd.Check()
-   }
-   ```
-5. `QuestionAdd.Check()` 将 `req.Content`（Markdown）转为 HTML 写入 `req.HTML`
+4. **结构化校验失败则 Checker 短路（修订误读）**：若 `Validate.Struct(value)` 返回错误，代码直接 return，不执行 `Checker.Check()`：
+
+```go
+// [validator.go#L210-L242]
+err = m.Validate.Struct(value)
+if err != nil {
+    // ... 组装 errFields ...
+    if len(errFields) > 0 {
+        // 直接 return，跳过下面的 Checker 接口调用！
+        return errFields, myErrors.BadRequest(reason.RequestFormatError).WithMsg(errMsg)
+    }
+}
+
+// 只有 Struct 校验通过，才会走到 Checker 接口调用
+if v, ok := value.(Checker); ok {
+    errFields, err = v.Check()
+}
+```
+
+5. 只有结构化校验通过后，才检测 value 是否实现 `Checker` 接口（第 244 行）并调用 `v.Check()`
+6. `QuestionAdd.Check()` 将 `req.Content`（Markdown）转为 HTML 写入 `req.HTML`
 
 **关键点**：
 - `HTML` 字段标记 `json:"-"`，前端不会传入，也不会被 `ShouldBind` 反序列化
 - `req.HTML` 的值**完全由 Check() 方法在 validator 链路中隐式赋值**
 - Controller 后续代码直接使用 `req.HTML`，但赋值时机隐藏在 validator 的 `Checker` 接口调用中，不在显式业务流程里
+- **结构化校验失败时 `req.HTML` 不会被赋值**（`Checker` 被短路跳过），此时 Controller 会因错误直接 return，使用不到 HTML 字段
 - `QuestionAddByAnswer.Check()` 同理，额外将 `req.AnswerContent` 转为 `req.AnswerHTML`
 - Tag 的 `ParsedText` 也是在此处隐式写入：`converter.Markdown2HTML(tag.OriginalText)`
 
@@ -655,28 +670,46 @@ func (rr *revisionRepo) UpdateObjectRevisionId(ctx context.Context, revision *en
 
 **原子性**：INSERT revision + UPDATE question.revision_id 在**同一个 XORM Transaction** 中完成，任一步失败即 Rollback。
 
-**免审语义**（`autoUpdateRevisionID=true`）：
+**autoUpdateRevisionID 仅控制 revision_id 指针回写，与审核无关**：
 
-- `AddRevision` 的第二个参数 `autoUpdateRevisionID` 决定是否立即将 revision.ID 写回目标对象的 `revision_id` 字段
-- **在 AddQuestion 中调用**：`revisionService.AddRevision(ctx, revisionDTO, true)`
-  - `autoUpdateRevisionID=true` → 立即更新 `question.revision_id = revision.ID`
-  - 含义：**新建问题的版本记录免审**，创建即生效，不需要管理员审核
-- **对比编辑场景**：当用户编辑问题但需要审核时，`autoUpdateRevisionID=false`，此时：
-  - 只 INSERT revision 记录（status=Unreviewed），不更新 question.revision_id
-  - revision_id 在管理员审批通过后才更新
+- `AddRevision` 的第二个参数 `autoUpdateRevisionID` 的唯一语义：是否在同一事务内 `UPDATE object.revision_id = revision.ID`
+- `true` → INSERT revision 后立即 UPDATE 目标对象的 revision_id 字段
+- `false` → 仅 INSERT revision，不更新 revision_id
+- **该参数与"免审"完全无关**
 
-**Revision 状态常量**：[revision_entity.go](file:///d:/fz/0601-1/solo-dogfeeding/code/61-answer/internal/entity/revision_entity.go#L27-L34)
+**审核语义由 revisionDTO.Status 决定**（非 autoUpdateRevisionID）：
+
+真正控制审核状态的是 `schema.AddRevisionDTO.Status` 字段：
+
+```go
+// 编辑场景（需审核时）：
+if !canUpdate {
+    revisionDTO.Status = entity.RevisionUnreviewedStatus  // =1 待审核
+} else {
+    revisionDTO.Status = entity.RevisionReviewPassStatus  // =2 审核通过
+}
+```
+
+- **AddQuestion 场景**（[question_service.go#L417-L426](file:///d:/fz/0601-1/solo-dogfeeding/code/61-answer/internal/service/content/question_service.go#L417-L426)）：`revisionDTO.Status` 未显式赋值，零值为 0
+- **编辑免审场景**（[question_service.go#L1039-L1043](file:///d:/fz/0601-1/solo-dogfeeding/code/61-answer/internal/service/content/question_service.go#L1039-L1043)）：显式设为 `RevisionReviewPassStatus(2)`，并先 UPDATE question 本体
+- **编辑待审核场景**：显式设为 `RevisionUnreviewedStatus(1)`，不更新 question 本体
+
+**Revision 状态常量**：[revision_entity.go](file:///d:/fz/0601-1/solo-dogfeeding/code/61-answer/internal/entity/revision_entity.go#L27-L49)
 
 ```go
 const (
-    RevisionNormalStatus      = 0  // 正常（创建时默认，免审生效）
-    RevisionUnreviewedStatus  = 1  // 待审核
-    RevisionReviewPassStatus  = 2  // 审核通过
-    RevisionReviewRejectStatus = 3 // 审核拒绝
+    RevisionNormalStatus       = 0  // 默认值（零值，创建时使用）
+    RevisionUnreviewedStatus   = 1  // 待审核
+    RevisionReviewPassStatus   = 2  // 审核通过
+    RevisionReviewRejectStatus = 3  // 审核拒绝
 )
+
+type Revision struct {
+    Status int `xorm:"not null default 1 INT(11) status"`  // 数据库默认值也是 1（待审核）
+}
 ```
 
-AddQuestion 创建 revision 时 `Status` 未显式设置，默认为 `RevisionNormalStatus(0)`，即**免审正常状态**。
+**实体默认值 vs Go 零值注意**：Revision 实体 `Status` 字段 XORM tag 写的是 `default 1`，但 Go struct 零值为 0。实际插入时使用的是 Go 零值 0，因为 Insert 时并未显式指定状态字段。
 
 **allowRecord 白名单**（第 188-199 行）：只有 question、answer、tag 三种对象类型允许记录版本，其他类型静默返回 nil。
 
@@ -816,7 +849,40 @@ func (ts *TagCommonService) CreateOrUpdateTagRelList(ctx context.Context, object
 | 新增 rel | objectId+tagID 组合不存在 | `AddTagRelList` |
 | 重新启用 rel | rel 已存在但状态为非 Available/Hide | `EnableTagRelByIDs` |
 
-`defaultTagRelStatus` 由 `GetTagRelDefaultStatusByObjectID` 决定：如果问题已被审核通过，新 rel 状态为 Available；如果问题待审核，新 rel 状态为 Hide。
+**defaultTagRelStatus 真实逻辑（修订误读）**：[tag_rel_repo.go#L195-L207](file:///d:/fz/0601-1/solo-dogfeeding/code/61-answer/internal/repo/tag/tag_rel_repo.go#L195-L207)
+
+```go
+func (tr *tagRelRepo) GetTagRelDefaultStatusByObjectID(ctx context.Context, objectID string) (status int, err error) {
+    question := entity.Question{}
+    exist, err := tr.data.DB.Context(ctx).ID(objectID).Cols("show", "status").Get(&question)
+    if exist && (question.Show == entity.QuestionHide || question.Status == entity.QuestionStatusDeleted) {
+        return entity.TagRelStatusHide, nil
+    }
+    return entity.TagRelStatusAvailable, nil
+}
+```
+
+只有当问题的 **`Show == QuestionHide`（被隐藏）** 或 **`Status == QuestionStatusDeleted`（已删除）** 时，才返回 Hide。**与"待审核(Pending)还是已通过(Available)"完全无关**，Pending 状态同样返回 Available。
+
+**SlugName 规范化（先 ToLower 再转 Dash）**：[tag_common.go#L674-L707](file:///d:/fz/0601-1/solo-dogfeeding/code/61-answer/internal/service/tag_common/tag_common.go#L674-L707)
+
+```go
+// 第一轮：查询已有标签前，先 ToLower
+for _, t := range objectTagData.Tags {
+    t.SlugName = strings.ToLower(t.SlugName)           // 先转小写
+    thisObjTagNameList = append(thisObjTagNameList, t.SlugName)
+}
+// 第二轮：发现是新标签，ToLower 后再 ReplaceAll 空格→横线
+for _, tag := range objectTagData.Tags {
+    _, ok := tagInDbMapping[strings.ToLower(tag.SlugName)]
+    if ok { continue }
+    item := &entity.Tag{}
+    item.SlugName = strings.ReplaceAll(tag.SlugName, " ", "-")  // 再转 Dash
+    // ...
+}
+```
+
+注意**顺序不可逆**：先 ToLower 统一大小写做匹配，匹配不上确认是新标签后，再 ReplaceAll 空格→横线生成入库的 SlugName。
 
 最后 `RefreshTagQuestionCount` 重新计算所有受影响标签的 `question_count`（含新增和删除的标签）。
 
@@ -855,6 +921,17 @@ func (q *Queue[T]) processMessage(msg T) {
    - 数据库操作使用的是 `context.TODO()`，无法被请求生命周期管控
 4. 源码中的 TODO 注释也承认了这一点：`// TODO: Consider adding timeout or using a derived context`
 5. `Send()` 方法虽然接收 `ctx context.Context` 参数（第 63 行），但仅用于 channel 写入时的 context cancel 检测，并未将 ctx 传递到消息中
+
+**Handler 未注册则 msg 静默丢弃（修订误读）**：
+
+第 120-123 行检查 `handler == nil`（未注册）时：
+```go
+if handler == nil {
+    log.Warnf("[%s] no handler registered, dropping message: %+v", q.name, msg)
+    return
+}
+```
+消息被直接 `return` 丢弃，只有一条 `log.Warnf` 日志记录。没有重试、没有死信队列、没有 panic。若队列初始化顺序错误导致 handler 注册晚于消息投递，消息会静默丢失。
 
 ---
 
@@ -913,6 +990,19 @@ func (lr *LimitRepo) ClearRecord(ctx context.Context, key string) error {
     return lr.data.Cache.Del(ctx, constant.RateLimitCacheKeyPrefix+key)
 }
 ```
+
+**Get + Set 非原子（修订误读）**：
+
+`CheckAndRecord` 先执行 `Cache.GetString`（读），再执行 `Cache.SetString`（写），是两个独立的缓存操作，中间存在竞态窗口：
+
+```
+请求 A: GetString(key) → false（不存在）
+请求 B: GetString(key) → false（不存在） ← 同时进入
+请求 A: SetString(key)  ✓
+请求 B: SetString(key)  ✓ ← 两个请求都通过，防重失效
+```
+
+未使用 Redis 的 `SETNX` 或 `SET ... NX` 原子命令，也没有分布式锁。在并发相同请求下防重可能被突破。
 
 **常量**: [cache_key.go](file:///d:/fz/0601-1/solo-dogfeeding/code/61-answer/internal/base/constant/cache_key.go#L51-L52)
 
