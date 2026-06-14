@@ -1385,6 +1385,348 @@ func CheckConfigFileAndRedirectToInstallPage(ctx *gin.Context) {
 
 ---
 
+## 十五、计数差异纠偏：22 个 Req 结构体 / 24 个 Update 端点 / 26 次 m.do 调用的精确清单
+
+### 15.1 Mentor.InitDB 实际 26 次 m.do 调用（而非 28 步）
+
+在 [init.go](file:///d:/fz/0601-1/solo-dogfeeding/code/70-answer/internal/migrations/init.go#L65-L92) 中逐行统计：
+
+| # | taskName 字符串 | 实际执行函数 |
+|---|----------------|------------|
+| 1 | `"check table exist"` | `m.checkTableExist` |
+| 2 | `"sync table"` | `m.syncTable` |
+| 3 | `"init version table"` | `m.initVersionTable` |
+| 4 | `"init admin user"` | `m.initAdminUser` |
+| 5 | `"init config"` | `m.initConfig` |
+| 6 | `"init default privileges config"` | `m.initDefaultRankPrivileges` |
+| 7 | `"init role"` | `m.initRole` |
+| 8 | `"init power"` | `m.initPower` |
+| 9 | `"init role power rel"` | `m.initRolePowerRel` |
+| 10 | `"init admin user role rel"` | `m.initAdminUserRoleRel` |
+| 11 | `"init site info interface"` | `m.initSiteInfoInterface` |
+| 12 | `"init site info users settings"` | `m.initSiteInfoUsersSettings` |
+| 13 | `"init site info general config"` | `m.initSiteInfoGeneralData` |
+| 14 | `"init site info login config"` | `m.initSiteInfoLoginConfig` |
+| 15 | `"init site info theme config"` | `m.initSiteInfoThemeConfig` |
+| 16 | `"init site info seo config"` | `m.initSiteInfoSEOConfig` |
+| 17 | `"init site info user config"` | `m.initSiteInfoUsersConfig` |
+| 18 | `"init site info privilege rank"` | `m.initSiteInfoPrivilegeRank` |
+| 19 | `"init site info write"` | `m.initSiteInfoAdvanced` |
+| 20 | `"init site info write"` | `m.initSiteInfoQuestions` |
+| 21 | `"init site info write"` | `m.initSiteInfoTags` |
+| 22 | `"init site info security"` | `m.initSiteInfoSecurityConfig` |
+| 23 | `"init default content"` | `m.initDefaultContent` |
+| 24 | `"init default badges"` | `m.initDefaultBadges` |
+| 25 | `"init default ai config"` | `m.initSiteInfoAI` |
+| 26 | `"init default MCP config"` | `m.initSiteInfoMCP` |
+
+**之前误记为 28 步的原因**：第 19/20/21 三步共用同一个 taskName `"init site info write"`，如果按 taskName 去重会漏记为 24；如果按函数语义粗分（如把 advanced/questions/tags 视为一个大步骤）容易误记为 28。实际 `m.do()` 函数调用次数为 **26 次**。
+
+### 15.2 controller_admin 实际 24 个 Update* 端点
+
+grep `func (.*Controller) Update\w+` 精确统计 [controller_admin](file:///d:/fz/0601-1/solo-dogfeeding/code/70-answer/internal/controller_admin) 目录结果为 **24 个**：
+
+| # | Controller | Handler 函数 | HTTP 方法 | 路由路径 | 请求结构体 |
+|---|-----------|-------------|----------|---------|-----------|
+| 1 | SiteInfo | `UpdateSeo` | PUT | /siteinfo/seo | SiteSeoReq |
+| 2 | SiteInfo | `UpdateGeneral` | PUT | /siteinfo/general | SiteGeneralReq |
+| 3 | SiteInfo | `UpdateInterface` | PUT | /siteinfo/interface | SiteInterfaceReq |
+| 4 | SiteInfo | `UpdateUsersSettings` | PUT | /siteinfo/users-settings | SiteUsersSettingsReq |
+| 5 | SiteInfo | `UpdateBranding` | PUT | /siteinfo/branding | SiteBrandingReq |
+| 6 | SiteInfo | `UpdateSiteQuestion` | PUT | /siteinfo/question | SiteQuestionsReq |
+| 7 | SiteInfo | `UpdateSiteTag` | PUT | /siteinfo/tag | SiteTagsReq |
+| 8 | SiteInfo | `UpdateSiteAdvanced` | PUT | /siteinfo/advanced | SiteAdvancedReq |
+| 9 | SiteInfo | `UpdateSitePolices` | PUT | /siteinfo/polices | SitePoliciesReq |
+| 10 | SiteInfo | `UpdateSiteSecurity` | PUT | /siteinfo/security | SiteSecurityReq |
+| 11 | SiteInfo | `UpdateSiteLogin` | PUT | /siteinfo/login | SiteLoginReq |
+| 12 | SiteInfo | `UpdateSiteCustomCssHTML` | PUT | /siteinfo/custom-css-html | SiteCustomCssHTMLReq |
+| 13 | SiteInfo | `UpdateSiteUsers` | PUT | /siteinfo/users | SiteUsersReq |
+| 14 | SiteInfo | `UpdateSMTPConfig` | PUT | /setting/smtp | UpdateSMTPConfigReq |
+| 15 | SiteInfo | `UpdatePrivilegesConfig` | PUT | /setting/privileges | UpdatePrivilegesConfigReq |
+| 16 | SiteInfo | `UpdateAIConfig` | PUT | /ai-config | SiteAIReq |
+| 17 | SiteInfo | `UpdateMCPConfig` | PUT | /mcp-config | SiteMCPReq |
+| 18 | UserAdmin | `UpdateUserStatus` | PUT | /user/status | UpdateUserStatusReq |
+| 19 | UserAdmin | `UpdateUserRole` | PUT | /user/role | UpdateUserRoleReq |
+| 20 | UserAdmin | `UpdateUserPassword` | PUT | /user/password | UpdateUserPasswordReq |
+| 21 | Badge | `UpdateBadgeStatus` | PUT | /badge/status | UpdateBadgeStatusReq |
+| 22 | AdminAPIKey | `UpdateAPIKey` | PUT | /api-key | UpdateAPIKeyReq |
+| 23 | Plugin | `UpdatePluginStatus` | PUT | /plugin/status | UpdatePluginStatusReq |
+| 24 | Plugin | `UpdatePluginConfig` | PUT | /plugin/config | UpdatePluginConfigReq |
+
+**隐藏的第 25 个写操作端点**：SiteInfo 中的 `SaveSiteTheme`（PUT /siteinfo/theme → SiteThemeReq）命名使用 `Save` 前缀而非 `Update`，所以未出现在 `Update\w+` grep 结果中。因此 **实际 PUT 端点总数为 25**。
+
+### 15.3 SiteInfo 系列 22 个 Req 结构体的完整界定
+
+从 [siteinfo_schema.go](file:///d:/fz/0601-1/solo-dogfeeding/code/70-answer/internal/schema/siteinfo_schema.go) 按以下规则统计 22 个结构体（不含纯 Resp 类型）：
+
+| # | 结构体名 | 用途 | validate tag | 特殊方法/标注 |
+|---|---------|------|-------------|-------------|
+| 1 | `SiteGeneralReq` | 基本信息（站点名/URL/邮箱） | required+santizer+url+email | `FormatSiteUrl()` |
+| 2 | `SiteInterfaceReq` | 界面设置（语言/时区） | required | 2 字段 Deprecated 标记为 `json:"-"` |
+| 3 | `SiteInterfaceSettingsReq` | 界面设置新版（同字段） | required | `SiteInterfaceSettingsResp` 别名 |
+| 4 | `SiteUsersSettingsReq` | 用户设置（头像/Gravatar） | oneof=system gravatar | `SiteUsersSettingsResp` 别名 |
+| 5 | `SiteBrandingReq` | 品牌配置（Logo/MobileLogo/SquareIcon/Favicon） | omitempty+长度 | - |
+| 6 | `SiteWriteReq` | 旧版写作设置（Deprecated） | 10 个字段混合 | 被拆分为 QuestionsReq/AdvancedReq/TagsReq |
+| 7 | `SiteWriteTag` | 标签结构（嵌套子结构） | required=slug_name | - |
+| 8 | `SiteQuestionsReq` | 问题配置（最小标签/内容/限制回答） | gte/lte 数值范围 | - |
+| 9 | `SiteAdvancedReq` | 高级配置（图片/附件/Megapixel） | omitempty+gt0 | GetMaxImageSize() 单位转换方法 |
+| 10 | `SiteTagsReq` | 标签配置（保留/推荐/必填） | dive 嵌套校验 | UserID 字段 `json:"-"` |
+| 11 | `SiteLegalReq` | 旧版法律条款（Deprecated） | oneof 外部内容展示 | 被拆分为 PoliciesReq+SecurityReq |
+| 12 | `SitePoliciesReq` | 服务条款+隐私政策 | 无（纯文本 HTML） | `SitePoliciesResp` 别名 |
+| 13 | `SiteSecurityReq` | 安全配置（登录要求/外部内容/更新检查） | oneof 校验 | - |
+| 14 | `GetSiteLegalInfoReq` | 查询法律信息请求 | oneof=tos/privacy | `IsTOS()`/`IsPrivacy()` 方法 |
+| 15 | `SiteUsersReq` | 用户可编辑字段配置 | oneof+7 个 bool | - |
+| 16 | `SiteLoginReq` | 登录配置（注册/邮箱/密码/域名白名单） | 无 | - |
+| 17 | `SiteCustomCssHTMLReq` | 自定义 CSS/HTML（Header/Footer/Sidebar/Head/Css） | gt0+lte=65536 | - |
+| 18 | `SiteThemeReq` | 主题配置（Theme/ThemeConfig/ColorScheme/Layout） | oneof=Full-width/Fixed-width | - |
+| 19 | `SiteSeoReq` | SEO 配置（Permalink/Robots） | required+gte0+lte4 | `IsShortLink()` 方法 |
+| 20 | `SiteAIReq` | AI 配置（启用/provider/models/Prompt） | lte 长度限制 | `GetProvider()` 方法 |
+| 21 | `SiteMCPReq` | MCP 配置（Enabled） | omitempty | - |
+| 22 | `UpdateSMTPConfigReq` | SMTP 邮件配置 | oneof=SSL/TLS+端口范围 | `Check()` 校验 from_name 非邮箱格式 |
+
+**注**：`UpdatePrivilegesConfigReq` 定义在同文件但属于权限等级配置，不在 "SiteInfo 系列" 严格范围内；`SiteAIProvider` 和 `AIPromptConfig` 是 SiteAIReq 的内嵌子结构体，不计入独立计数。
+
+---
+
+## 十六、xorm 连接池参数的默认值与可配置性深度解析
+
+### 16.1 连接池三参数的 Go/Database 原生语义
+
+xorm 底层通过 `engine.DB()` 拿到 `*sql.DB`，三个参数直接透传到 Go 标准库 `database/sql`：
+
+| 参数 | xorm 方法 | Go sql.DB 方法 | 语义 |
+|------|----------|---------------|------|
+| MaxOpenConn | `SetMaxOpenConns(n)` | `SetMaxOpenConns(n)` | 同时打开的最大连接数（≤0 表示无限） |
+| MaxIdleConn | `SetMaxIdleConns(n)` | `SetMaxIdleConns(n)` | 空闲连接池大小（≤0 表示不保留） |
+| ConnMaxLifetime | `SetConnMaxLifetime(d)` | `SetConnMaxLifetime(d)` | 连接最大存活时间（≤0 表示永远复用） |
+
+### 16.2 配置结构体与 config.yaml 映射
+
+在 [config.go](file:///d:/fz/0601-1/solo-dogfeeding/code/70-answer/internal/base/data/config.go) 中：
+
+```go
+type Database struct {
+    Driver          string `yaml:"driver"`
+    Connection      string `yaml:"connection"`
+    ConnMaxLifeTime int    `yaml:"conn_max_life_time,omitempty"`
+    MaxOpenConn     int    `yaml:"max_open_conn,omitempty"`
+    MaxIdleConn     int    `yaml:"max_idle_conn,omitempty"`
+}
+```
+
+三个参数使用 `omitempty` tag，意味着 **值为 0 时不会写入 YAML**。嵌入的默认 [config.yaml](file:///d:/fz/0601-1/solo-dogfeeding/code/70-answer/configs/config.yaml) 中未设置这三个字段——所以初始配置文件中它们完全不存在。
+
+### 16.3 NewDB 中的条件应用逻辑
+
+在 [data.go](file:///d:/fz/0601-1/solo-dogfeeding/code/70-answer/internal/base/data/data.go#L56-L95) 的 `NewDB()` 中：
+
+```go
+func NewDB(debug bool, dataConf *Database) (*xorm.Engine, error) {
+    // SQLite 特殊处理：强制 MaxOpenConn = 1
+    if dataConf.Driver == "sqlite" {
+        // ...
+        dataConf.MaxOpenConn = 1   // ← 直接修改传入的 config 结构体
+    }
+
+    engine, _ := xorm.NewEngine(dataConf.Driver, dataConf.Connection)
+    engine.Ping()
+
+    // 三个参数全部使用 "值 > 0" 作为启用条件
+    if dataConf.MaxIdleConn > 0 {
+        engine.SetMaxIdleConns(dataConf.MaxIdleConn)
+    }
+    if dataConf.MaxOpenConn > 0 {
+        engine.SetMaxOpenConns(dataConf.MaxOpenConn)
+    }
+    if dataConf.ConnMaxLifeTime > 0 {
+        engine.SetConnMaxLifetime(time.Duration(dataConf.ConnMaxLifeTime) * time.Second)
+    }
+    // ...
+}
+```
+
+### 16.4 各场景下的实际默认值对比
+
+| 数据库类型 | 配置文件是否设置 | MaxOpenConn | MaxIdleConn | ConnMaxLifetime |
+|-----------|---------------|-------------|-------------|-----------------|
+| **SQLite** | 否（默认） | **1**（代码硬编码强制） | Go 默认 2 | 永久（Go 默认 ∞） |
+| MySQL | 否（默认） | **无限**（Go 默认 0） | Go 默认 2 | 永久 |
+| PostgreSQL | 否（默认） | **无限**（Go 默认 0） | Go 默认 2 | 永久 |
+| MySQL | 是（手动设置） | 用户配置值 | 用户配置值 | 用户配置秒数 |
+
+**Go sql.DB 的原生默认值**（当 Answer 不设置时）：
+- `MaxOpenConns = 0`（无上限）
+- `MaxIdleConns = 2`（标准库默认保留 2 个空闲连接）
+- `ConnMaxLifetime = 0`（连接永远不超时回收）
+
+### 16.5 SQLite 强制单连接的原因
+
+SQLite 文件级数据库 **不支持并发写**。如果多个 goroutine 同时持有连接并写入，会触发 `database is locked` 错误。因此代码强制：
+
+```go
+if dataConf.Driver == "sqlite" {
+    dataConf.MaxOpenConn = 1  // ← 强制串行化所有数据库操作
+}
+```
+
+但这带来副作用：高并发请求下所有 DB 操作排队等待，吞吐量受限。因此生产环境推荐 PostgreSQL/MySQL。
+
+### 16.6 手动配置三参数示例
+
+在 `data/conf/config.yaml` 中追加：
+
+```yaml
+data:
+  database:
+    driver: mysql
+    connection: "user:pass@tcp(db:3306)/answer?charset=utf8mb4&parseTime=True"
+    max_open_conn: 100          # 最多同时打开 100 个连接
+    max_idle_conn: 10           # 空闲池保留 10 个
+    conn_max_life_time: 3600    # 连接 1 小时后强制回收重建（秒）
+```
+
+典型配置指导：
+- **MaxOpenConn**：建议 MySQL `max_connections` 的 70%~80%，避免耗尽服务端连接
+- **MaxIdleConn**：设置为 MaxOpenConn 的 10%~20%，减少频繁握手开销
+- **ConnMaxLifetime**：建议 3600s（1 小时），配合云数据库空闲超时和防火墙 TCP keepalive
+
+---
+
+## 十七、管理员角色权限矩阵：role_power_rel 与 user_role_rel 的初始化链路
+
+### 17.1 权限系统的三张核心表
+
+| 表名 | 含义 | 核心字段 |
+|------|-----|---------|
+| `role` | 角色定义 | ID, Name, Description |
+| `power` | 权限定义 | ID, Name, PowerType（权限标识符字符串） |
+| `role_power_rel` | 角色-权限关联（N:N） | RoleID, PowerType |
+| `user_role_rel` | 用户-角色关联（N:N） | UserID, RoleID |
+
+```
+用户 (user)
+  │
+  ├── user_role_rel ──→ 角色 (role)
+  │                         │
+  │                         └── role_power_rel ──→ 权限 (power)
+  │
+  └── Rank（等级/声望值）─→ 等级权限矩阵 (config 表中的 rank.* 配置)
+```
+
+### 17.2 初始化链路：Mentor.InitDB 中 4 步的精确顺序
+
+在 [init.go](file:///d:/fz/0601-1/solo-dogfeeding/code/70-answer/internal/migrations/init.go#L72-L76) 中，权限相关初始化严格依赖顺序：
+
+```
+步骤 7 m.do("init role", ...)                → 插入 3 条 role 记录
+           ↓ （依赖 role.ID 存在）
+步骤 8 m.do("init power", ...)               → 插入 41 条 power 记录
+           ↓ （依赖 role + power 两端主键存在）
+步骤 9 m.do("init role power rel", ...)      → 插入 83 条 role_power_rel 记录
+           ↓ （依赖 user.id=1 + role.id=2 存在）
+步骤10 m.do("init admin user role rel", ...) → 插入 1 条 user_role_rel 记录
+```
+
+**顺序不可颠倒**的原因：`role_power_rel` 和 `user_role_rel` 的外键（逻辑外键，非数据库 FK）依赖前两张表的数据。同时步骤 6 的 `initAdminUser` 必须在步骤 10 之前完成（创建 ID=1 的用户）。
+
+### 17.3 roles：3 个预定义角色
+
+在 [init_data.go](file:///d:/fz/0601-1/solo-dogfeeding/code/70-answer/internal/migrations/init_data.go#L84-L88)：
+
+```go
+roles = []*entity.Role{
+    {ID: 1, Name: "User",      Description: "Default with no special access."},
+    {ID: 2, Name: "Admin",     Description: "Have the full power to access the site."},
+    {ID: 3, Name: "Moderator", Description: "Has access to all posts except admin settings."},
+}
+```
+
+注意 **Role ID=1 的 "User" 角色不分配任何权限**——普通用户的权限来自 Rank（声望等级）系统，通过 `config` 表中的 `rank.*` 键值控制（如提问要求声望 ≥1）。
+
+### 17.4 powers：41 个权限定义
+
+[init_data.go](file:///d:/fz/0601-1/solo-dogfeeding/code/70-answer/internal/migrations/init_data.go#L90-L132) 中定义了 41 个权限，ID 从 1 到 41：
+
+| ID 范围 | 类别 | 典型权限 |
+|--------|------|---------|
+| 1 | 管理后台 | AdminAccess（进入 /admin 的准入权限） |
+| 2-9 | 问题操作 | QuestionAdd/Edit/Delete/Close/Reopen/VoteUp/VoteDown/Pin/Hide/Show |
+| 10-16 | 回答操作 | AnswerAdd/Edit/Delete/Accept/VoteUp/VoteDown/Invite |
+| 17-21 | 评论操作 | CommentAdd/Edit/Delete/VoteUp/VoteDown |
+| 22 | 举报 | ReportAdd |
+| 23-28 | 标签操作 | TagAdd/Edit/EditWithoutReview/EditSlugName/Delete/Synonym |
+| 29-30 | 其他 | LinkUrlLimit（链接数量限制）/ VoteDetail（查看投票详情） |
+| 31-33 | 审核 | AnswerAudit / QuestionAudit / TagAudit |
+| 34-41 | 恢复 & 置顶 | Pin/Unpin/Hide/Show（问题）+ Recover（问题/回答/标签） |
+
+### 17.5 rolePowerRels：83 条角色-权限关联
+
+[init_data.go](file:///d:/fz/0601-1/solo-dogfeeding/code/70-answer/internal/migrations/init_data.go#L134-L219) 定义了完整的权限矩阵：
+
+| 角色 ID | 角色名 | 分配的权限数 | 权限范围 |
+|---------|--------|-------------|---------|
+| 2 | Admin | **42 条** | ID 1-41 全部 41 个权限 + TagUseReservedTag（共 42，因 1-41 中未单独枚举 ID=168 的 TagUseReservedTag 但在 powers 列表末尾） |
+| 3 | Moderator | **41 条** | ID 2-41 除 AdminAccess 外的全部权限 + TagUseReservedTag |
+| 1 | User | **0 条** | 不使用 role_power_rel 机制（完全依赖 Rank 声望） |
+
+**关键差异点**：Admin 比 Moderator 多一个 `AdminAccess`（`permission.AdminAccess`）。这是唯一区分管理员和版主权限的开关——**缺少它则无法访问任何 `/answer/admin/api/*` 路由**（由 Admin 中间件在请求入口校验）。
+
+```go
+// rolePowerRels 的差异对比（只列两端不同的行）：
+{RoleID: 2, PowerType: permission.AdminAccess},   // ← 仅 Admin 有
+{RoleID: 2, PowerType: permission.QuestionAdd},    // ← 两者都有
+{RoleID: 3, PowerType: permission.QuestionAdd},    // ← 两者都有
+// ... 中间 40 个权限两者完全一致 ...
+```
+
+### 17.6 adminUserRoleRel：ID=1 用户绑定 Admin 角色
+
+[init_data.go](file:///d:/fz/0601-1/solo-dogfeeding/code/70-answer/internal/migrations/init_data.go#L221-L224)：
+
+```go
+adminUserRoleRel = &entity.UserRoleRel{
+    UserID: "1",   // 对应 initAdminUser 创建的管理员
+    RoleID: 2,     // 绑定到 Admin 角色（获得全部 42 条权限）
+}
+```
+
+这行代码保证了安装向导中创建的管理员账户默认拥有系统最高权限。后续在管理后台（`UpdateUserRole` 端点）可以为其他用户授予 Moderator 或 Admin 角色。
+
+### 17.7 权限查询与验证的运行时链路
+
+```
+HTTP 请求到达 Admin 路由
+        │
+        ▼
+  AdminAuthMiddleware（中间件）
+        │
+        ├── 从 JWT 取出 UserID
+        │
+        ├── user_role_rel 表查询用户所有 RoleID
+        │       返回：[2] （用户 ID=1 只有 Admin 角色）
+        │
+        ├── role_power_rel 表批量查询这些角色的所有 PowerType
+        │       返回：[AdminAccess, QuestionAdd, AnswerAdd, ... 共 42 个]
+        │
+        └── 检查路由所需权限是否在 PowerType 列表中
+                │
+                ├── 存在 → 放行到 Controller
+                └── 不存在 → 返回 403 Forbidden
+```
+
+### 17.8 Deprecated 结构体的权限初始化对应关系
+
+权限系统早期版本的 `SiteWriteReq`（写作设置）和 `SiteLegalReq`（法律条款）虽然在 schema 层被标记为 Deprecated，但它们对应的 **Rank 权限配置并未废弃**——而是被拆分到三个独立的 `SiteInfo` 类型中：
+
+| 已废弃结构体 | 被拆分为 | 初始化对应 m.do 步骤 |
+|------------|---------|-------------------|
+| SiteWriteReq（MinimumContent/MaxImageSize/...） | SiteQuestionsReq + SiteAdvancedReq + SiteTagsReq | L84-L86 的 3 次 `init site info write` 调用 |
+| SiteLegalReq（TOS/Privacy/ExternalContent） | SitePoliciesReq + SiteSecurityReq | `initSiteInfoSecurityConfig`（外部内容）+ 数据层面手动写入 policies（通过 admin API 后续配置） |
+
+Rank 声望权限本身通过 `defaultConfigTable`（[init_data.go](file:///d:/fz/0601-1/solo-dogfeeding/code/70-answer/internal/migrations/init_data.go#L226-L357)）的 `rank.*` 系列 key 在步骤 5 `init config` 时一次性插入，与权限矩阵无关。
+
+---
+
 ## 十二、Admin 端 19 个 SiteInfoReq 系列结构体与 22 个 Update 端点的完整映射
 
 ### 12.1 18 个 SiteInfo 核心 Update 端点（siteinfo_controller.go）
