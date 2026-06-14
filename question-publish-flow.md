@@ -548,3 +548,409 @@ POST /answer/api/v1/question/answer
 | 向量同步 | [vector_sync.go](file:///d:/fz/0601-1/solo-dogfeeding/code/61-answer/internal/service/vector_sync/vector_sync.go) | VectorSearch 插件控制 |
 | 搜索同步 | [search_sync.go](file:///d:/fz/0601-1/solo-dogfeeding/code/61-answer/internal/repo/search_sync/search_sync.go) | Search 插件控制 |
 | 常量 | [object_type.go](file:///d:/fz/0601-1/solo-dogfeeding/code/61-answer/internal/base/constant/object_type.go) | 对象类型映射 |
+| 校验器 | [validator.go](file:///d:/fz/0601-1/solo-dogfeeding/code/61-answer/internal/base/validator/validator.go) | 参数校验 + Checker 接口 |
+| 限流 | [rate_limit.go](file:///d:/fz/0601-1/solo-dogfeeding/code/61-answer/internal/base/middleware/rate_limit.go) | 防重复提交 |
+| 限流存储 | [limit.go](file:///d:/fz/0601-1/solo-dogfeeding/code/61-answer/internal/repo/limit/limit.go) | Cache 存储限流键 |
+| 版本 | [revision_repo.go](file:///d:/fz/0601-1/solo-dogfeeding/code/61-answer/internal/repo/revision/revision_repo.go) | Revision 事务写入 |
+| 标签 | [tag_common.go](file:///d:/fz/0601-1/solo-dogfeeding/code/61-answer/internal/service/tag_common/tag_common.go) | 标签双写 + rel 管理 |
+| 版本实体 | [revision_entity.go](file:///d:/fz/0601-1/solo-dogfeeding/code/61-answer/internal/entity/revision_entity.go) | Revision 实体 |
+
+---
+
+## 十一、QuestionAdd.Check：在 validator 链路隐式写 req.HTML
+
+**文件**: [internal/schema/question_schema.go](file:///d:/fz/0601-1/solo-dogfeeding/code/61-answer/internal/schema/question_schema.go#L78-L104)
+
+```go
+type QuestionAdd struct {
+    Title   string     `validate:"required,notblank,gte=6,lte=150" json:"title"`
+    Content string     `validate:"gte=0,lte=65535" json:"content"`
+    HTML    string     `json:"-"`          // 注意：json:"-" 不参与反序列化
+    Tags    []*TagItem `validate:"dive" json:"tags"`
+    // ...
+}
+
+func (req *QuestionAdd) Check() (errFields []*validator.FormErrorField, err error) {
+    req.HTML = converter.Markdown2HTML(req.Content)       // 隐式写 HTML
+    for _, tag := range req.Tags {
+        if len(tag.OriginalText) > 0 {
+            tag.ParsedText = converter.Markdown2HTML(tag.OriginalText)  // 隐式写标签 HTML
+        }
+    }
+    return nil, nil
+}
+```
+
+**调用链路**（在 Controller 的 `BindAndCheckReturnErr` 中）：
+
+1. `handler.BindAndCheckReturnErr(ctx, req)` → [handler.go](file:///d:/fz/0601-1/solo-dogfeeding/code/61-answer/internal/base/handler/handler.go#L63-L78)
+2. 内部调用 `validator.GetValidatorByLang(lang).Check(data)` → [validator.go](file:///d:/fz/0601-1/solo-dogfeeding/code/61-answer/internal/base/validator/validator.go#L190-L257)
+3. `Check()` 方法先执行 `m.Validate.Struct(value)` 做结构化校验
+4. **然后**检测 value 是否实现 `Checker` 接口（第 244 行）：
+   ```go
+   if v, ok := value.(Checker); ok {
+       errFields, err = v.Check()    // ← 在此处调用 QuestionAdd.Check()
+   }
+   ```
+5. `QuestionAdd.Check()` 将 `req.Content`（Markdown）转为 HTML 写入 `req.HTML`
+
+**关键点**：
+- `HTML` 字段标记 `json:"-"`，前端不会传入，也不会被 `ShouldBind` 反序列化
+- `req.HTML` 的值**完全由 Check() 方法在 validator 链路中隐式赋值**
+- Controller 后续代码直接使用 `req.HTML`，但赋值时机隐藏在 validator 的 `Checker` 接口调用中，不在显式业务流程里
+- `QuestionAddByAnswer.Check()` 同理，额外将 `req.AnswerContent` 转为 `req.AnswerHTML`
+- Tag 的 `ParsedText` 也是在此处隐式写入：`converter.Markdown2HTML(tag.OriginalText)`
+
+---
+
+## 十二、AddRevision：事务内 INSERT + UPDATE 原子操作，含免审语义
+
+**Repository**: [internal/repo/revision/revision_repo.go](file:///d:/fz/0601-1/solo-dogfeeding/code/61-answer/internal/repo/revision/revision_repo.go#L57-L85)
+
+```go
+func (rr *revisionRepo) AddRevision(ctx context.Context, revision *entity.Revision, autoUpdateRevisionID bool) (err error) {
+    objectTypeNumber, err := obj.GetObjectTypeNumberByObjectID(revision.ObjectID)
+    if err != nil {
+        return errors.BadRequest(reason.ObjectNotFound)
+    }
+    revision.ObjectType = objectTypeNumber
+    if !rr.allowRecord(revision.ObjectType) {
+        return nil   // 不允许记录的对象类型，静默跳过
+    }
+    _, err = rr.data.DB.Transaction(func(session *xorm.Session) (any, error) {
+        session = session.Context(ctx)
+        // 步骤 1: INSERT revision 记录
+        _, err = session.Insert(revision)
+        if err != nil {
+            _ = session.Rollback()
+            return nil, errors.InternalServer(reason.DatabaseError).WithError(err).WithStack()
+        }
+        // 步骤 2: 若 autoUpdateRevisionID=true，UPDATE 目标对象的 revision_id
+        if autoUpdateRevisionID {
+            err = rr.UpdateObjectRevisionId(ctx, revision, session)
+            if err != nil {
+                _ = session.Rollback()
+                return nil, err
+            }
+        }
+        return nil, nil
+    })
+    return err
+}
+```
+
+`UpdateObjectRevisionId` 实现（第 88-102 行）：
+
+```go
+func (rr *revisionRepo) UpdateObjectRevisionId(ctx context.Context, revision *entity.Revision, session *xorm.Session) (err error) {
+    tableName, _ := obj.GetObjectTypeStrByObjectID(revision.ObjectID) // "question" / "answer" / "tag"
+    _, err = session.Table(tableName).Where("id = ?", revision.ObjectID).Cols("`revision_id`").Update(struct {
+        RevisionID string `xorm:"revision_id"`
+    }{
+        RevisionID: revision.ID,
+    })
+    return err
+}
+```
+
+**原子性**：INSERT revision + UPDATE question.revision_id 在**同一个 XORM Transaction** 中完成，任一步失败即 Rollback。
+
+**免审语义**（`autoUpdateRevisionID=true`）：
+
+- `AddRevision` 的第二个参数 `autoUpdateRevisionID` 决定是否立即将 revision.ID 写回目标对象的 `revision_id` 字段
+- **在 AddQuestion 中调用**：`revisionService.AddRevision(ctx, revisionDTO, true)`
+  - `autoUpdateRevisionID=true` → 立即更新 `question.revision_id = revision.ID`
+  - 含义：**新建问题的版本记录免审**，创建即生效，不需要管理员审核
+- **对比编辑场景**：当用户编辑问题但需要审核时，`autoUpdateRevisionID=false`，此时：
+  - 只 INSERT revision 记录（status=Unreviewed），不更新 question.revision_id
+  - revision_id 在管理员审批通过后才更新
+
+**Revision 状态常量**：[revision_entity.go](file:///d:/fz/0601-1/solo-dogfeeding/code/61-answer/internal/entity/revision_entity.go#L27-L34)
+
+```go
+const (
+    RevisionNormalStatus      = 0  // 正常（创建时默认，免审生效）
+    RevisionUnreviewedStatus  = 1  // 待审核
+    RevisionReviewPassStatus  = 2  // 审核通过
+    RevisionReviewRejectStatus = 3 // 审核拒绝
+)
+```
+
+AddQuestion 创建 revision 时 `Status` 未显式设置，默认为 `RevisionNormalStatus(0)`，即**免审正常状态**。
+
+**allowRecord 白名单**（第 188-199 行）：只有 question、answer、tag 三种对象类型允许记录版本，其他类型静默返回 nil。
+
+---
+
+## 十三、ChangeTag：新标签双写与旧 rel 删除
+
+**调用入口**：[question_service.go#L1160-L1166](file:///d:/fz/0601-1/solo-dogfeeding/code/61-answer/internal/service/content/question_service.go#L1160-L1166)
+
+```go
+func (qs *QuestionService) ChangeTag(ctx context.Context, objectTagData *schema.TagChange) (...) {
+    minimumTags, _ := qs.tagCommon.GetMinimumTags(ctx)
+    return qs.tagCommon.ObjectChangeTag(ctx, objectTagData, minimumTags)
+}
+```
+
+**核心实现**：[tag_common.go#L661-L864](file:///d:/fz/0601-1/solo-dogfeeding/code/61-answer/internal/service/tag_common/tag_common.go#L661-L864)
+
+### 13.1 新标签双写：tag 表 + revision + activity
+
+```go
+// 比对提交的 tag 名称与数据库已有标签，找出新增标签
+addTagList := make([]*entity.Tag, 0)
+for _, tag := range objectTagData.Tags {
+    _, ok := tagInDbMapping[strings.ToLower(tag.SlugName)]
+    if ok {
+        continue   // 已存在的标签，跳过
+    }
+    // 构建新标签实体
+    item := &entity.Tag{}
+    item.SlugName = strings.ReplaceAll(tag.SlugName, " ", "-")
+    item.DisplayName = tag.DisplayName
+    item.OriginalText = tag.OriginalText
+    item.ParsedText = tag.ParsedText      // 已在 Check() 中转为 HTML
+    item.Status = entity.TagStatusAvailable
+    item.UserID = objectTagData.UserID
+    addTagList = append(addTagList, item)
+}
+
+if len(addTagList) > 0 {
+    // 双写第一写：批量 INSERT tag 表
+    err = ts.tagCommonRepo.AddTagList(ctx, addTagList)
+
+    for _, tag := range addTagList {
+        // 双写第二写：为每个新标签创建 revision 记录
+        revisionDTO := &schema.AddRevisionDTO{
+            UserID:   objectTagData.UserID,
+            ObjectID: tag.ID,
+            Title:    tag.SlugName,
+        }
+        tagInfoJson, _ := json.Marshal(tag)
+        revisionDTO.Content = string(tagInfoJson)
+        revisionID, _ := ts.revisionService.AddRevision(ctx, revisionDTO, true)  // 免审
+
+        // 双写第三写：发送 Activity 事件（TagCreated）
+        ts.activityQueueService.Send(ctx, &schema.ActivityMsg{
+            UserID:           objectTagData.UserID,
+            ObjectID:         tag.ID,
+            OriginalObjectID: tag.ID,
+            ActivityTypeKey:  constant.ActTagCreated,
+            RevisionID:       revisionID,
+        })
+    }
+}
+```
+
+**双写总结**：对每个新标签，依次执行三写操作：
+1. **tag 表** INSERT（`AddTagList`）
+2. **revision 表** INSERT + tag.revision_id UPDATE（`AddRevision(ctx, dto, true)`，事务原子，免审）
+3. **Activity 队列** Send（`ActTagCreated`）
+
+### 13.2 旧 rel 删除：CreateOrUpdateTagRelList
+
+```go
+err = ts.CreateOrUpdateTagRelList(ctx, objectTagData.ObjectID, thisObjTagIDList)
+```
+
+**实现**：[tag_common.go#L799-L864](file:///d:/fz/0601-1/solo-dogfeeding/code/61-answer/internal/service/tag_common/tag_common.go#L799-L864)
+
+```go
+func (ts *TagCommonService) CreateOrUpdateTagRelList(ctx context.Context, objectId string, tagIDs []string) (err error) {
+    addTagIDMapping := make(map[string]struct{})
+    for _, t := range tagIDs {
+        addTagIDMapping[t] = struct{}{}       // 新标签 ID 集合
+    }
+
+    // 1. 获取当前对象的所有旧 tag_rel
+    oldTagRelList, _ := ts.tagRelRepo.GetObjectTagRelList(ctx, objectId)
+
+    // 2. 比对：旧 rel 中不在新集合中的 → 加入删除列表
+    var deleteTagRel []int64
+    for _, rel := range oldTagRelList {
+        if _, ok := addTagIDMapping[rel.TagID]; !ok {
+            deleteTagRel = append(deleteTagRel, rel.ID)
+            needRefreshTagIDs = append(needRefreshTagIDs, rel.TagID)
+        }
+    }
+
+    // 3. 对新标签：不存在 rel 则创建，已存在但被移除过则重新启用
+    addTagRelList := make([]*entity.TagRel, 0)
+    enableTagRelList := make([]int64, 0)
+    defaultTagRelStatus, _ := ts.tagRelRepo.GetTagRelDefaultStatusByObjectID(ctx, objectId)
+    for _, tagID := range tagIDs {
+        rel, exist, _ := ts.tagRelRepo.GetObjectTagRelWithoutStatus(ctx, objectId, tagID)
+        if !exist {
+            addTagRelList = append(addTagRelList, &entity.TagRel{  // 新建 rel
+                TagID: tagID, ObjectID: objectId, Status: defaultTagRelStatus,
+            })
+        }
+        if exist && rel.Status != entity.TagRelStatusAvailable && rel.Status != entity.TagRelStatusHide {
+            enableTagRelList = append(enableTagRelList, rel.ID)   // 重新启用被删除的 rel
+        }
+    }
+
+    // 4. 执行删除
+    if len(deleteTagRel) > 0 {
+        ts.tagRelRepo.RemoveTagRelListByIDs(ctx, deleteTagRel)
+    }
+    // 5. 执行新增
+    if len(addTagRelList) > 0 {
+        ts.tagRelRepo.AddTagRelList(ctx, addTagRelList)
+    }
+    // 6. 执行重新启用
+    if len(enableTagRelList) > 0 {
+        ts.tagRelRepo.EnableTagRelByIDs(ctx, enableTagRelList, ...)
+    }
+    // 7. 刷新所有受影响标签的 question_count
+    ts.RefreshTagQuestionCount(ctx, needRefreshTagIDs)
+}
+```
+
+**rel 管理的三种操作**：
+
+| 操作 | 条件 | 方法 |
+|------|------|------|
+| 删除旧 rel | 旧 rel 的 TagID 不在新 tagIDs 中 | `RemoveTagRelListByIDs` |
+| 新增 rel | objectId+tagID 组合不存在 | `AddTagRelList` |
+| 重新启用 rel | rel 已存在但状态为非 Available/Hide | `EnableTagRelByIDs` |
+
+`defaultTagRelStatus` 由 `GetTagRelDefaultStatusByObjectID` 决定：如果问题已被审核通过，新 rel 状态为 Available；如果问题待审核，新 rel 状态为 Hide。
+
+最后 `RefreshTagQuestionCount` 重新计算所有受影响标签的 `question_count`（含新增和删除的标签）。
+
+---
+
+## 十四、Queue Worker 用 context.TODO 丢弃请求 ctx
+
+**文件**: [internal/base/queue/queue.go](file:///d:/fz/0601-1/solo-dogfeeding/code/61-answer/internal/base/queue/queue.go#L114-L130)
+
+```go
+func (q *Queue[T]) processMessage(msg T) {
+    q.mu.RLock()
+    handler := q.handler
+    q.mu.RUnlock()
+
+    if handler == nil {
+        log.Warnf("[%s] no handler registered, dropping message: %+v", q.name, msg)
+        return
+    }
+
+    // Use background context for async processing
+    // TODO: Consider adding timeout or using a derived context
+    if err := handler(context.TODO(), msg); err != nil {
+        log.Errorf("[%s] handler error: %v", q.name, err)
+    }
+}
+```
+
+**问题分析**：
+
+1. `processMessage` 在 worker goroutine 中被调用，与原始 HTTP 请求完全解耦
+2. `handler(context.TODO(), msg)` 传入 `context.TODO()`，**不是**原始请求的 `ctx`
+3. **后果**：
+   - 请求级别的 `ctx` 中的 traceID、language、user-agent 等上下文信息**全部丢失**
+   - 请求超时/取消信号无法传递到异步处理中
+   - 数据库操作使用的是 `context.TODO()`，无法被请求生命周期管控
+4. 源码中的 TODO 注释也承认了这一点：`// TODO: Consider adding timeout or using a derived context`
+5. `Send()` 方法虽然接收 `ctx context.Context` 参数（第 63 行），但仅用于 channel 写入时的 context cancel 检测，并未将 ctx 传递到消息中
+
+---
+
+## 十五、DuplicateRequestRejection：MD5 键 + TTL + defer Clear
+
+**中间件**: [internal/base/middleware/rate_limit.go](file:///d:/fz/0601-1/solo-dogfeeding/code/61-answer/internal/base/middleware/rate_limit.go#L47-L72)
+
+```go
+func (rm *RateLimitMiddleware) DuplicateRequestRejection(ctx *gin.Context, req any) (reject bool, key string) {
+    userID := GetLoginUserIDFromContext(ctx)
+    fullPath := ctx.FullPath()
+    reqJson, _ := json.Marshal(req)
+    key = encryption.MD5(fmt.Sprintf("%s:%s:%s", userID, fullPath, string(reqJson)))
+    var err error
+    reject, err = rm.limitRepo.CheckAndRecord(ctx, key)
+    if err != nil {
+        log.Errorf("check and record rate limit error: %s", err.Error())
+        return false, key
+    }
+    if !reject {
+        return false, key
+    }
+    log.Debugf("duplicate request: [%s] %s", fullPath, string(reqJson))
+    handler.HandleResponse(ctx, errors.BadRequest(reason.DuplicateRequestError), nil)
+    return true, key
+}
+
+func (rm *RateLimitMiddleware) DuplicateRequestClear(ctx *gin.Context, key string) {
+    err := rm.limitRepo.ClearRecord(ctx, key)
+    if err != nil {
+        log.Errorf("clear rate limit error: %s", err.Error())
+    }
+}
+```
+
+**Cache 存储**: [internal/repo/limit/limit.go](file:///d:/fz/0601-1/solo-dogfeeding/code/61-answer/internal/repo/limit/limit.go#L46-L65)
+
+```go
+func (lr *LimitRepo) CheckAndRecord(ctx context.Context, key string) (limit bool, err error) {
+    _, exist, err := lr.data.Cache.GetString(ctx, constant.RateLimitCacheKeyPrefix+key)
+    if err != nil {
+        return false, errors.InternalServer(reason.DatabaseError).WithError(err).WithStack()
+    }
+    if exist {
+        return true, nil        // 键已存在 → 判定为重复请求
+    }
+    err = lr.data.Cache.SetString(ctx, constant.RateLimitCacheKeyPrefix+key,
+        fmt.Sprintf("%d", time.Now().Unix()), constant.RateLimitCacheTime)
+    if err != nil {
+        return false, errors.InternalServer(reason.DatabaseError).WithError(err).WithStack()
+    }
+    return false, nil           // 首次写入 → 非重复请求
+}
+
+func (lr *LimitRepo) ClearRecord(ctx context.Context, key string) error {
+    return lr.data.Cache.Del(ctx, constant.RateLimitCacheKeyPrefix+key)
+}
+```
+
+**常量**: [cache_key.go](file:///d:/fz/0601-1/solo-dogfeeding/code/61-answer/internal/base/constant/cache_key.go#L51-L52)
+
+```go
+RateLimitCacheKeyPrefix = "answer:rate-limit:"
+RateLimitCacheTime      = 5 * time.Minute
+```
+
+**在 Controller 中的使用**：[question_controller.go#L390-L399](file:///d:/fz/0601-1/solo-dogfeeding/code/61-answer/internal/controller/question_controller.go#L390-L399)
+
+```go
+reject, rejectKey := qc.rateLimitMiddleware.DuplicateRequestRejection(ctx, req)
+if reject {
+    return
+}
+defer func() {
+    // If status is not 200 means that the bad request has been returned,
+    // so the record should be cleared
+    if ctx.Writer.Status() != http.StatusOK {
+        qc.rateLimitMiddleware.DuplicateRequestClear(ctx, rejectKey)
+    }
+}()
+```
+
+**完整机制**：
+
+| 环节 | 实现 | 说明 |
+|------|------|------|
+| **键生成** | `MD5(userID:fullPath:reqJson)` | 用户 + 路由 + 请求体 三要素哈希 |
+| **键前缀** | `answer:rate-limit:` + MD5值 | Cache 命名空间隔离 |
+| **TTL** | `5 * time.Minute` | 5 分钟自动过期 |
+| **判定逻辑** | Cache.Get 存在 → 重复；不存在 → 写入 Cache.Set | 即写即查模式 |
+| **写入值** | `time.Now().Unix()` 时间戳 | 仅用于标记存在性，值无业务含义 |
+| **defer Clear** | `ctx.Writer.Status() != 200` 时清除 | 业务失败（校验不通过等）不应占用防重配额 |
+| **不 Clear** | `Status == 200` 时保留 | 成功请求保留 5 分钟防重锁，避免重复提交 |
+
+**defer Clear 的语义**：
+- 防重复提交的本质是防止**成功请求**被重复执行
+- 如果请求因校验失败返回 400/403，说明请求根本没生效，此时应**清除锁键**，允许用户修正后重新提交
+- 如果请求成功返回 200，锁键保留 5 分钟自动过期，期间相同内容的重复请求被拦截
+- `defer` 确保 Clear 逻辑在函数返回时一定执行，无论成功还是 panic
