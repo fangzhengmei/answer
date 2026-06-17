@@ -645,9 +645,26 @@ func (qs *QuestionCommon) SitemapCron(ctx context.Context) {
 |------|---------|------|------|
 | Cache-Aside | 所有读场景 | 简单灵活，缓存故障不影响DB | 首次查询必查DB |
 | Write-Through | 配置、站点信息 | 缓存与DB强一致 | 写操作耗时增加 |
-| Write-Invalidate | 红点、计数 | 并发安全，避免竞态 | 下次查询需回源 |
+| Write-Invalidate | 认证Token/visit token、用户状态、红点/徽章、限流、验证码、邮箱码、插件KV（共12处，见 4.1 节） | 并发安全，避免竞态 | 下次查询需回源 |
 | 异步队列 | 活动、事件、索引 | 主流程快，解耦彻底 | 最终一致性，有延迟 |
 | 内存缓存 | 单机部署 | 高性能，无需额外组件 | 多实例部署数据不一致 |
+
+**Write-Invalidate 适用场景详表（与 4.1 节 12 处 Cache.Del 对齐）**：
+
+| 分类 | 场景 | 对应代码 |
+|------|------|---------|
+| **认证会话（5处）** | 删除用户 access token 缓存 | [auth.go:102 `RemoveUserCacheInfo`](file:///d:/fz/0601-2/solo-dogfeeding/code/17-answer/internal/repo/auth/auth.go#L100-L107) |
+| **认证会话（5处）** | 删除访客 visit token → access token 映射 | [auth.go:111 `RemoveUserVisitCacheInfo`](file:///d:/fz/0601-2/solo-dogfeeding/code/17-answer/internal/repo/auth/auth.go#L109-L116) |
+| **认证会话（5处）** | 删除用户状态变更标记（封禁/角色变更） | [auth.go:148 `RemoveUserStatus`](file:///d:/fz/0601-2/solo-dogfeeding/code/17-answer/internal/repo/auth/auth.go#L146-L153) |
+| **认证会话（5处）** | 删除管理员后台 access token | [auth.go:187 `RemoveAdminUserCacheInfo`](file:///d:/fz/0601-2/solo-dogfeeding/code/17-answer/internal/repo/auth/auth.go#L185-L192) |
+| **认证会话（5处）** | 批量登出后删除 userID → token 列表映射 | [auth.go:236 `RemoveUserTokens`](file:///d:/fz/0601-2/solo-dogfeeding/code/17-answer/internal/repo/auth/auth.go#L210-L239) |
+| **红点徽章（2处）** | 删除通知红点计数（Inbox/Achievement） | [notification.go:277 `DeleteRedDot`](file:///d:/fz/0601-2/solo-dogfeeding/code/17-answer/internal/service/notification_common/notification.go#L270-L282) |
+| **红点徽章（2处）** | 移除徽章后列表为空时删除 | [notification.go:322 `RemoveBadgeAwardAlertCache`](file:///d:/fz/0601-2/solo-dogfeeding/code/17-answer/internal/service/notification_common/notification.go#L308-L325) |
+| **限流验证码（3处）** | 清理限流记录 | [limit.go:64 `ClearRecord`](file:///d:/fz/0601-2/solo-dogfeeding/code/17-answer/internal/repo/limit/limit.go#L62-L65) |
+| **限流验证码（3处）** | 删除每日操作频率记录 | [captcha.go:83 `DelActionType`](file:///d:/fz/0601-2/solo-dogfeeding/code/17-answer/internal/repo/captcha/captcha.go#L80-L88) |
+| **限流验证码（3处）** | 删除图形验证码（调用方传key） | [captcha.go:112 `DelCaptcha`](file:///d:/fz/0601-2/solo-dogfeeding/code/17-answer/internal/repo/captcha/captcha.go#L111-L117) |
+| **邮箱验证码（1处）** | 验证成功后删除邮箱验证码 | [email_repo.go:75 `VerifyCode`](file:///d:/fz/0601-2/solo-dogfeeding/code/17-answer/internal/repo/export/email_repo.go#L63-L76) |
+| **插件 KV（1处）** | 插件 KV 写入/删除后清理缓存 | [kv_storage.go:132 `cleanCache`](file:///d:/fz/0601-2/solo-dogfeeding/code/17-answer/plugin/kv_storage.go#L127-L135) |
 
 ### 7.3 代码要点速查表
 
