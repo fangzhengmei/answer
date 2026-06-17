@@ -267,6 +267,214 @@ if r.Unsafe || !goldmarkHTML.IsDangerousURL(n.Destination) {
 
 ---
 
+
+
+### 3.8 图片 `<img src>` 安全流程
+
+图片在 Markdown 中的语法为 `![alt](src "title")`，处理链路为 **goldmark 渲染器 → bluemonday 两层过滤**，与链接 `<a href>` 流程类似但少了 govalidator.IsURL 校验。
+
+#### 3.8.1 第 1 层：goldmark `renderImage`（项目未覆盖，走 goldmark 默认渲染器）
+
+项目 `DangerousHTMLRenderer` 的 `RegisterFuncs` 只注册了 `HTMLBlock`/`RawHTML`/`Link`/`AutoLink` **四种**，**没有覆盖 `ast.KindImage`**，因此图片走 goldmark v1.7.4 的 [renderImage](https://github.com/yuin/goldmark/blob/v1.7.4/renderer/html/html.go) 默认实现：
+
+```go
+func (r *Renderer) renderImage(..., entering bool) ... {
+    if !entering { return ast.WalkContinue, nil }
+    n := node.(*ast.Image)
+    _, _ = w.WriteString("<img src=\"")
+    if r.Unsafe || !IsDangerousURL(n.Destination) {
+        _, _ = w.Write(util.EscapeHTML(util.URLEscape(n.Destination, true)))
+    }
+    _, _ = w.WriteString(`\" alt=\"`)
+    r.renderAttribute(w, source, n)   // alt 文本走 SecureWrite
+    ...
+    if n.Attributes() != nil {
+        RenderAttributes(w, n, ImageAttributeFilter)
+    }
+}
+```
+
+关键约束：
+- **`IsDangerousURL` 检查**（同 `renderLink`）：拦截 `javascript:`/`vbscript:`/`data:` 等危险协议
+- **`URLEscape(n.Destination, true)`**：URL 百分号编码
+- **`EscapeHTML`**：HTML 实体转义
+- **无 `govalidator.IsURL` 检查**（不像 `renderLink`/`renderAutoLink` 有 `renderLinkIsUrl` 守卫）——格式不合法但非危险协议的 URL（如相对路径）会被直接渲染
+- `ImageAttributeFilter` 扩展了 `GlobalAttributeFilter`，放行 `align`/`border`/`crossorigin`/`height`/`loading`/`srcset`/`usemap`/`width` 等，但这些属性在 bluemonday 第 2 层会被进一步过滤
+
+#### 3.8.2 第 1a 层：RawHTML 中的 `<img>`（内嵌严格 UGCPolicy）
+
+如果作者直接在内联原始 HTML 中写 `<img src="...">`（如 `<img src="javascript:alert(1)">`），会走 [renderRawHTML](file:///d:/fz/0601-2/solo-dogfeeding/code/16-answer/pkg/converter/markdown.go#L104-L118) 的 bluemonday 默认 UGCPolicy：
+- **第 1 关**：`requireParseableURLs=true` + scheme 白名单 `mailto`/`http`/`https`，`validURL` 校验不通过的 `src` 被移除
+- **第 2 关**：`AllowStyling()` 未被调用，`class`/`style` 属性全被移除
+- **结果**：`<img src="http://example.com/a.png">` 保留；`<img src="javascript:...">` 被移除 src
+
+#### 3.8.3 第 1b 层：HTMLBlock 中的 `<img>`
+
+整个块被 `SecureWrite` 转义为纯文本 `&lt;img ...&gt;`，与其他 HTMLBlock 内容一致。
+
+#### 3.8.4 第 2 层：放宽版 UGCPolicy 的 img 策略
+
+第 2 层 [Markdown2HTML](file:///d:/fz/0601-2/solo-dogfeeding/code/16-answer/pkg/converter/markdown.go#L56-L64) 虽然调用了 `RequireParseableURLs(false)`（取消 URL scheme 白名单），但 UGCPolicy 的 `AllowImages()` 已经定义好：
+
+```go
+// bluemonday helpers.go AllowImages()
+func (p *Policy) AllowImages() {
+    p.AllowAttrs("align").Matching(ImageAlign).OnElements("img")
+    p.AllowAttrs("alt").Matching(Paragraph).OnElements("img")
+    p.AllowStandardURLs()           // 把 img.src 加入 URL 属性清单
+    p.AllowAttrs("src").OnElements("img")
+}
+```
+
+`AllowStandardURLs()` 的作用是把 `img.src` 加入 `sanitize.go` 中 `requireParseableURLs` 块处理的 URL 属性清单（sanitize.go 注释明列 `- img.src`）。但由于第 2 层设了 `RequireParseableURLs(false)`，**整个 URL 校验块被跳过**，`img.src` 的 `validURL`/scheme 白名单校验都不执行，`ap.regexp == nil` 直接保留值。
+
+**但这并不意味着风险**：
+- Markdown 语法路径的图片 src 在 goldmark `renderImage` 中已经过 `IsDangerousURL` 拦截，危险协议到不了第 2 层
+- RawHTML 路径的 `<img>` 已被 1a 层处理完毕
+
+#### 3.8.5 图片 src 多层过滤汇总表
+
+| 输入路径 | 第 1 层拦截点 | 拦截机制 | 到达第 2 层时的状态 | 第 2 层行为 |
+|---------|---------|---------|---------|---------|
+| Markdown `![alt](src)` | goldmark `renderImage` → `IsDangerousURL` + URLEscape + EscapeHTML | 拦截 `javascript:`/`vbscript:`/`data:`，值被 URL 编码/HTML 转义 | `<img src="经编码的值" alt="...">`（无危险协议） | `ap.regexp == nil` 直接保留 src；`srcset`/`style`/`class` 等非白名单属性被移除 |
+| RawHTML `<img src="...">` | `sanitizeAttrs` → `validURL`（1a 层） | `javascript:` 等 scheme 不通过白名单，src 被移除 | src 合法则保留，否则 src 被移除 | 合法 src 继续保留 |
+| HTMLBlock `<img src="...">` | `SecureWrite` | HTML 实体转义 | 完全文本化 | 无需处理 |
+
+### 3.9 评论正文写入流程
+
+评论与问答正文不同：**问答正文的 Markdown 渲染在前端完成**（前端发请求提交时即携带 `parsed_text`），而**评论正文的 Markdown→HTML 转换在后端 schema 校验阶段完成**。
+
+#### 3.9.1 写入链路全景
+
+```
+CommentController.AddComment
+  └─ gin 绑定 & 校验 schema.AddCommentReq.Check()
+       └─ converter.Markdown2HTML(req.OriginalText)  →  req.ParsedText
+  └─ commentService.AddComment(ctx, req)
+       ├─ copier.Copy(comment, req)        # OriginalText / ParsedText 一起复制
+       ├─ comment.Status = CommentStatusAvailable
+       ├─ objectInfoService.GetInfo(...)   # 校验对象存在且未被删
+       ├─ (reply) commentCommonRepo.GetComment + 设 ReplyUserID/ReplyCommentID
+       ├─ commentRepo.AddComment(ctx, comment)   # 入库，写入 original_text & parsed_text
+       └─ reviewService.AddCommentReview(...)     # 审核打标，可能改 status
+```
+
+#### 3.9.2 关键代码证据
+
+**Schema 校验阶段渲染 HTML**（[comment_schema.go](file:///d:/fz/0601-2/solo-dogfeeding/code/16-answer/internal/schema/comment_schema.go#L59-L68)）：
+
+```go
+func (req *AddCommentReq) Check() (errFields []*validator.FormErrorField, err error) {
+    req.ParsedText = converter.Markdown2HTML(req.OriginalText)  // 与问答共用同一套 Markdown2HTML
+    if req.ParsedText == "" {
+        return ... errors.BadRequest(reason.CommentContentCannotEmpty)
+    }
+    return nil, nil
+}
+```
+
+**评论长度约束**：`OriginalText` 的 validate tag 为 `gte=2,lte=600`，即评论最多 600 字符（问答正文无此硬上限）。
+
+**Service 层写入**（[comment_service.go](file:///d:/fz/0601-2/solo-dogfeeding/code/16-answer/internal/service/comment/comment_service.go#L133-L177)）：
+- 使用 `copier.Copy` 把请求体的 `OriginalText` 和 `ParsedText` 原样复制到 entity
+- `commentRepo.AddComment` 直接写入 DB，**不会再次调用 bluemonday 净化**
+- `reviewService.AddCommentReview` 只打审核状态标签（`Pending`/`Available`），不改 ParsedText 内容
+
+**更新评论时**（`UpdateComment`，[comment_service.go](file:///d:/fz/0601-2/solo-dogfeeding/code/16-answer/internal/service/comment/comment_service.go#L302-L340)）：前端同样提交 `OriginalText` + `ParsedText`，由 controller 层的 schema `Check()` 重新调用 `Markdown2HTML`。
+
+#### 3.9.3 评论 vs 问答正文：流程差异
+
+| 维度 | 问答正文（Question/Answer） | 评论（Comment） |
+|------|--------------------------|--------------|
+| Markdown 渲染位置 | 前端（前端生成 `parsed_text` 提交） | 后端（schema.Check 调用 `Markdown2HTML`） |
+| 二次净化 | 后端不重跑 Markdown，只接受前端提交的 `parsed_text` | 后端生成 `parsed_text`，使用同一套 `Markdown2HTML` |
+| XSS 管道一致性 | **一致**：最终都经由 `Markdown2HTML` 的 goldmark+bluemonday 两层 | **一致**：经由同一 `Markdown2HTML` |
+| 评论专属 | — | AddCommentReq.Check 后还会走审核服务（`AddCommentReview`），非 Approved 不对外展示 |
+| 长度硬上限 | 无 | OriginalText `lte=600` |
+| 链接替换（UpdateQuestionLink） | Question/Answer 写入时调用 `UpdateQuestionLink` 校验 `#ID`/站内链接并替换 href | **不调用**：评论不做站内链接检测与替换 |
+
+> **结论**：评论正文走的是与问答正文**完全相同**的 Markdown→HTML 管道（同一 [Markdown2HTML](file:///d:/fz/0601-2/solo-dogfeeding/code/16-answer/pkg/converter/markdown.go#L40-L66)），防护层完全复用。差异点在于评论在 schema 校验阶段就完成了渲染，且额外经过审核状态打标，**不参与 UpdateQuestionLink 的站内链接替换**。
+
+### 3.10 无效站内链接处理：UpdateQuestionLink 链路
+
+站内问答中引用其他问答（以 URL 形式或 `#ID` 形式）需要被校验为"有效"后才能真正写入，否则保持原状、不建立关联。这一处理不影响 HTML 安全性（不引入新的 XSS 风险），但影响 SEO 链接图谱和导航正确性。
+
+#### 3.10.1 调用位置
+
+`UpdateQuestionLink` 只在以下四个入口被调用（[question_service.go](file:///d:/fz/0601-2/solo-dogfeeding/code/16-answer/internal/service/content/question_service.go#L398) / [answer_service.go](file:///d:/fz/0601-2/solo-dogfeeding/code/16-answer/internal/service/content/answer_service.go#L283)）：
+- 新增 Question（`questionService.AddQuestion`）
+- 更新 Question（`questionService.UpdateQuestion`）
+- 新增 Answer（`answerService.AddAnswer`）
+- 更新 Answer（`answerService.UpdateAnswer`）
+
+**评论不调用此函数**（见 3.9 节）。
+
+#### 3.10.2 `GetQuestionLink`：从正文提取链接（[question_link.go](file:///d:/fz/0601-2/solo-dogfeeding/code/16-answer/pkg/checker/question_link.go#L39-L62)）
+
+扫描 `originalText`（Markdown 原文，不是 HTML）中的两种模式：
+
+| 模式 | 扫描方式 | 解析结果 |
+|------|---------|---------|
+| URL 路径 `/questions/xxx[/yyy]` | 逐字符匹配字符串 `/questions/`（**不是正则**，也不检查完整 URL），匹配后读取连续数字/字母为 QuestionID，可选 `/` 后再读为 AnswerID | `QuestionLinkTypeURL`，QuestionID + 可选 AnswerID |
+| ID 形式 `#ID` | 遇到字符 `#`，读取后续连续数字/字母 | `QuestionLinkTypeID`，先判断是 Question 还是 Answer |
+
+**注意**：`GetQuestionLink` **扫描的是 `originalText`（Markdown 原文）**，不是 parsed HTML。URL 协议、域名等部分**完全忽略**——只要包含 `/questions/1234` 字符串段就会被匹配（如 `example.com/questions/1234`、`/questions/1234`、`https://a.b/questions/1234` 都能命中）。
+
+ID 合法性在 `addUniqueID` 中通过 `obj.GetObjectTypeStrByObjectID(uid.DeShortID(id))` 校验（[question_link.go L99-L130](file:///d:/fz/0601-2/solo-dogfeeding/code/16-answer/pkg/checker/question_link.go#L99-L130)）：
+- ID 首位（DeShortID 后）必须符合 Question/Answer 对象前缀规则（见单测 step 14 `Error id`，ID `10110000000000060` 首位 `101` 非问答类型 → 返回空）
+- 不能重复添加（`uniqueIDs` map 去重）
+
+#### 3.10.3 ID 有效性二次校验（DB 查询）
+
+`GetQuestionLink` 只做对象类型前缀校验，`UpdateQuestionLink` 随后做 DB 查询（[question_common.go L723-L807](file:///d:/fz/0601-2/solo-dogfeeding/code/16-answer/internal/service/question_common/question.go#L723-L807)）：
+
+```go
+links := checker.GetQuestionLink(originalText)
+// 1. answerRepo.GetByIDs → answerCache
+// 2. questionRepo.FindByID  → questionCache
+
+for _, link := range links {
+    // QuestionID 不在 questionCache 中 → skip（无效链接，不替换）
+    if _, exists := questionCache[linkQuestionID]; linkQuestionID != "0" && !exists {
+        continue
+    }
+    // AnswerID 不在 answerCache 中 → skip
+    if linkAnswerID != "0" {
+        if _, exists := answerCache[linkAnswerID]; !exists {
+            continue
+        }
+    }
+    // 构建有效链接，并替换 parsedText 中的 #ID → <a href="/questions/xxx">#ID</a>
+}
+```
+
+#### 3.10.4 替换机制：只替换 `#ID`，不替换 URL
+
+注意替换逻辑只操作 `parsedText` 中 `#` 前缀的 ID 字符串（[L793-L801](file:///d:/fz/0601-2/solo-dogfeeding/code/16-answer/internal/service/question_common/question.go#L793-L801)）：
+
+```go
+if link.QuestionID != "" {
+    htmlLink := fmt.Sprintf("<a href=\"/questions/%s\">#%s</a>", link.QuestionID, link.QuestionID)
+    parsedText = strings.ReplaceAll(parsedText, "#"+link.QuestionID, htmlLink)
+}
+```
+
+**对 URL 形式的站内链接（如 `https://host/questions/1234`）不做任何改写**——它们在 Markdown→HTML 转换阶段已经由 goldmark 渲染为 `<a href="https://host/questions/1234">`，UpdateQuestionLink 只负责：
+1. 记录 QuestionLink 关联（用于站内链接图、被引用计数）
+2. ID 形式 `#1234` 的内联引用转成可点击 `<a>`
+
+#### 3.10.5 无效链接的三条路径处理汇总
+
+| 输入示例 | GetQuestionLink 是否提取 | DB 是否存在 | 行为 | 对用户可见效果 |
+|---------|----------------------|-----------|------|-------------|
+| `#10010000000000060`（有效 QuestionID） | 是 | 是 | 替换为 `<a href="/questions/xxx">#xxx</a>`，建立 QuestionLink | 可点击，计入反向引用计数 |
+| `#10020000000000060`（有效 AnswerID） | 是 | 是 | 替换为 `<a href="/questions/qid/aid">#aid</a>`，建立 QuestionLink | 可点击，计入反向引用计数 |
+| `#99999999999999999`（不存在） | 是（如果前缀合法） | 否 | skip（不替换、不入库） | 原样保留为纯文本 `#9999...` |
+| `/questions/invalid` | 否（"invalid" 非 Question 前缀 ID） | — | skip | Markdown 中的 URL 由 goldmark 正常渲染，不建立关联 |
+| `https://host/questions/10010000000000060` | 是 | 是 | 不替换 parsedText，只建立 QuestionLink 关联 | URL 链接可点击（goldmark 已渲染），计入反向引用计数 |
+| `#10110000000000060`（前缀 101 非问答类型，见单测） | 否（GetQuestionLink 的 `addUniqueID` 提前过滤） | — | skip | 原样保留为纯文本 |
+| `javascript:alert(1)` | 否（不含 `/questions/` 或 `#`） | — | skip | 由 Markdown 渲染管道正常拦截（见 3.5 节） |
+
 ## 四、第 3 层：Service 层链接替换 —— 结构性二次净化
 
 **代码位置**：[question_common/question.go:703-828](file:///d:/fz/0601-2/solo-dogfeeding/code/16-answer/internal/service/question_common/question.go#L703-L828)
@@ -402,12 +610,14 @@ const useRenderHtmlPlugin = (element: HTMLElement | RefObject<HTMLElement> | nul
 | 1b | `renderHTMLBlock` | `SecureWrite` HTML 实体转义 | 块级原始 HTML 完全文本化，不可能执行 | 无 |
 | 1c | `renderLink` | IsURL + IsDangerousURL + EscapeHTML + URLEscape | `javascript:` 等危险协议、href 注入 | 无 |
 | 1d | `renderAutoLink` | IsURL + EscapeHTML + URLEscape（无 IsDangerousURL） | 格式非法 URL、href 注入 | 缺少 IsDangerousURL，由 govalidator.IsURL 兜底 |
+| 1e | `renderImage`（goldmark 默认） | IsDangerousURL + URLEscape + EscapeHTML | `javascript:`/`data:` 等危险协议、src 注入 | 无 govalidator.IsURL，但危险协议被 IsDangerousURL 拦截；格式不合法但非危险的相对路径会被保留（第 2 层作最终过滤） |
 | 2 | Bluemonday 放宽版 UGCPolicy | 标签白名单 + 属性白名单 + 正则约束 | 漏过第 1 层的危险标签/属性 | 取消 nofollow（前端补）、取消 URL 解析+scheme 校验（异常 href 到不了第 2 层）、**新增放行 `class`**（供 goldmark 代码块语言标记；RawHTML 的 class 已被 1a 层移除；**仍不放行 `style`**） |
-| 3 | `UpdateQuestionLink` | 验证 ID 存在后才替换链接、href 服务端格式化 | 伪造站内链接 ID、href 注入 | 无 |
+| 3 | `UpdateQuestionLink` + Comment Schema.Check | ID 存在才替换；评论在 schema.Check 重调 Markdown2HTML 生成 ParsedText | 伪造站内链接 ID；评论正文跳过前端直接提交 parsed_text 的可能 | 评论不参与站内链接替换与反向计数 |
 | 4 | ReviewService | 内容审核打标，非 Approved 不展示 | 垃圾/违规内容对外暴露 | 无 |
 | 5 | `dangerouslySetInnerHTML` | 只渲染后端 ParsedText | 前端自行拼接 HTML 导致的注入 | 无 |
 | 6 | `htmlRender` | 外链自动加 nofollow（补后端放宽的缺口） | 外链权重流失 | 无（非安全层，UX 增强） |
 | 7 | `useRenderHtmlPlugin` | 插件接收已净化 DOM | — | **插件可写 DOM，安全性依赖信任边界** |
+| 8 | `AddCommentReview` 评论审核 | 内容行为打标，非 Approved 不对外展示 | 评论正文含有伤害内容对外曝露 | 不改变 parsed_text，只影响过滤条件 |
 
 ---
 
@@ -434,3 +644,4 @@ const useRenderHtmlPlugin = (element: HTMLElement | RefObject<HTMLElement> | nul
 | [ui/src/pages/Questions/Detail/components/Question/index.tsx](file:///d:/fz/0601-2/solo-dogfeeding/code/16-answer/ui/src/pages/Questions/Detail/components/Question/index.tsx) | 问题正文渲染 |
 | [ui/src/pages/Questions/Detail/components/Answer/index.tsx](file:///d:/fz/0601-2/solo-dogfeeding/code/16-answer/ui/src/pages/Questions/Detail/components/Answer/index.tsx) | 回答正文渲染 |
 | [ui/src/utils/pluginKit/index.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/16-answer/ui/src/utils/pluginKit/index.ts#L328-L366) | 前端 useRenderHtmlPlugin 钩子 |
+
