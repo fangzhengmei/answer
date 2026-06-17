@@ -1,6 +1,6 @@
 # 问答正文 XSS 防护管道分析
 
-本文档梳理问答正文从作者输入到 Markdown 渲染再到前端展示的完整数据流，重点分析白名单收紧、属性清理与扩展点机制如何逐层降险。
+本文档梳理问答正文从作者输入到 Markdown 渲染再到前端展示的完整数据流，重点分析白名单放宽与收紧、属性清理与扩展点机制如何逐层降险。
 
 ---
 
@@ -147,9 +147,15 @@ bluemonday 内置的 UGC 策略默认配置：
 - 允许标签：`a, b, blockquote, br, caption, cite, code, col, colgroup, dd, del, dfn, dl, dt, em, figcaption, figure, h1-h6, hr, i, img, ins, kbd, li, mark, ol, p, pre, q, rp, rt, ruby, s, samp, small, strike, strong, sub, sup, table, tbody, td, tfoot, th, thead, tr, u, ul`
 - 移除标签：`script, iframe, form, object, embed, style` 等
 - 移除所有 `on*` 事件处理器
-- **默认 `RequireNoFollowOnLinks(true)`**：所有 `<a>` 自动加 `rel="nofollow"`
-- **默认 `RequireParseableURLs(true)`**：URL 属性值必须可被 `net/url.Parse` 解析
-- **默认不允许 `style` 属性**
+- **默认 `RequireNoFollowOnLinks(true)`**：所有 `<a>` 自动加 `rel="nofollow"`（由 `AllowStandardURLs()` 设置）
+- **默认 `RequireParseableURLs(true)`**：URL 属性值必须可被 `net/url.Parse` 解析（由 `AllowStandardURLs()` 设置）
+- **默认 `AllowURLSchemes("mailto", "http", "https")`**：仅允许这三个 URL scheme（由 `AllowStandardURLs()` 设置）
+- **默认 `AllowRelativeURLs(true)`**：允许相对 URL（由 `AllowStandardURLs()` 设置）
+- **默认不允许 `class` 属性**：UGCPolicy 源码注释明确写 `"class" is not permitted as we are not allowing users to style their own content`。`AllowStandardAttributes()` 只放行 `dir`、`lang`、`id`、`title`，不含 `class`
+- **默认不允许 `style` 属性**：UGCPolicy 源码注释明确写 `"style" is not permitted as we are not yet sanitising CSS and it is an XSS attack vector`。未调用 `AllowStyles()` 或 `AllowAttrs("style")`
+- **`AllowLists()` 只允许 `ol`/`ul` 的 `type`、`li` 的 `value`**：未允许 `start` 属性
+
+> **class/style 澄清**：UGCPolicy 默认**同时禁止** `class` 和 `style` 属性。项目代码调用 `AllowStyling()` 后，**仅放行 `class`**（受 `SpaceSeparatedTokens` 正则约束），`style` 仍被移除。goldmark 的 `GlobalAttributeFilter` 虽然包含 `class` 和 `style`（允许 AST 节点属性输出），但 bluemonday 第 2 层会过滤掉不被允许的属性。
 
 ### 3.2 放宽配置（在 UGCPolicy 基线上退让）
 
@@ -157,18 +163,101 @@ bluemonday 内置的 UGC 策略默认配置：
 |------|------------------|---------|------|
 | `RequireNoFollowOnLinks(false)` | true（所有链接加 nofollow） | false | **取消**对所有链接强制加 nofollow。后端输出的 `<a>` 不带 nofollow，外链 nofollow 由前端 `htmlRender` 补上 |
 | `RequireNoFollowOnFullyQualifiedLinks(false)` | true（绝对链接加 nofollow） | false | **取消**对绝对链接强制加 nofollow |
-| `RequireParseableURLs(false)` | true（URL 必须可解析） | false | **取消** URL 可解析性校验。不仅允许相对路径，也允许任何无法被 `net/url.Parse` 解析的 `href` 值通过。风险在于 bluemonday 不再拦截格式异常的 URL，但 goldmark 层已对链接做了 `govalidator.IsURL` + `EscapeHTML` 双重防护，所以对 Markdown 链接无实际影响；对 RawHTML 中的链接，第 1 层的默认 UGCPolicy 仍然校验 URL |
+| `RequireParseableURLs(false)` | true（URL 必须可解析 + scheme 白名单 `mailto`/`http`/`https`） | false | **同时取消**两项校验：(1) URL 可解析性（`net/url.Parse`）；(2) URL scheme 白名单。bluemonday `sanitizeAttrs` 中整个 URL 校验块包裹在 `if p.requireParseableURLs { ... }` 内，置 false 后 `AllowURLSchemes("mailto","http","https")` 设置的 scheme 白名单**不再生效**，`javascript:`/`data:` 等协议的 href 在第 2 层不会被拦截。**但实际无影响**：异常 href 到不了第 2 层（详见 3.5 节"异常链接过滤边界"分析） |
 
 ### 3.3 扩展配置（在 UGCPolicy 基线上新增能力）
 
 | 配置 | 效果 | 风险评估 |
 |------|------|---------|
-| `AllowStyling()` | **仅放行 `class` 属性**（全局，值须匹配 `SpaceSeparatedTokens`）。**不放行 `style`** | 常见误读：`AllowStyling()` 不等于允许 `style` 属性。bluemonday v1.0.27 的 `AllowStyling()` 实现只调用 `AllowAttrs("class").Matching(SpaceSeparatedTokens).Globally()`，源码注释明确说"当 bluemonday 内置 CSS 解析器后才会允许受控的 style 属性"。因此 `style` 属性在 UGCPolicy 与本项目策略下**均被移除**，用户无法通过 `style` 注入 CSS |
+| `AllowStyling()` | **相对 UGCPolicy 默认新增放行 `class` 属性**（全局，值须匹配 `SpaceSeparatedTokens` 正则 `^([\s\p{L}\p{N}_-]+)$`）。**仍不放行 `style`** | ① bluemonday v1.0.27 `AllowStyling()` 实现只调用 `AllowAttrs("class").Matching(SpaceSeparatedTokens).Globally()`，源码注释明确写"class is not permitted as we are not allowing users to style their own content"、"style is not permitted as we are not yet sanitising CSS"。② **放行 class 的实际用途**：goldmark `renderFencedCodeBlock`（html.go）对 \`\`\`go 代码块生成 `<code class="language-go">`，前端高亮插件据此 class 添加语法高亮。③ **两层 class 处理交互**：第 1a 层 RawHTML 的默认 UGCPolicy 不放行 class，内联原始 HTML 中的 class 属性全被剔除；第 2 层放宽版 UGCPolicy 新增放行 class，但此时 HTML 已经是 goldmark 生成的（非用户原始 HTML），class 值受 `SpaceSeparatedTokens` 正则约束。④ `style` 属性在 UGCPolicy 与本项目策略下**均被移除**，用户无法通过 `style` 注入 CSS |
 | `AllowElements("kbd")` | 额外放行 `<kbd>` | 低风险。kbd 标签无安全隐患 |
 | `AllowAttrs("title").Matching(regex).Globally()` | 全局允许 `title` 属性，值必须匹配 `^[\p{L}\p{N}\s\-_',\[\]!\./\\\(\)]*$` 或 `^@embed?$` | **叠加规则**。UGCPolicy 通过 `AllowStandardAttributes()` 已允许 `title`（含自己的正则约束 `Paragraph`）。此调用在 bluemonday 中是**追加**而非替换——`title` 值只要匹配 UGCPolicy 原有正则**或**此新增正则即可通过。新增正则的真正作用是放行 `@embed?` 值供 Embed 插件使用 |
-| `AllowAttrs("start").OnElements("ol")` | 允许 `<ol start="...">`，**未调用 `.Matching()`，bluemonday 不校验 start 值** | 实际安全。详见下方"属性值约束"分析 |
+| `AllowAttrs("start").OnElements("ol")` | 允许 `<ol start="...">`，**未调用 `.Matching()`，bluemonday 不校验 start 值** | 实际安全。详见 3.4 节"属性值约束"分析 |
 
-### 3.4 Markdown2BasicHTML（更严格的子集）
+### 3.4 属性值约束分析：start 属性是否受数值正则限制
+
+**结论：`AllowAttrs("start").OnElements("ol")` 没有数值正则约束，但 `start` 值在所有输入路径上实际都被约束为整数。**
+
+**bluemonday 行为**：从 bluemonday v1.0.27 `policy.go` 的 `OnElements` 实现看，未调用 `.Matching()` 时 `attrPolicyBuilder.regexp` 为 nil，生成的 `attrPolicy.regexp` 也为 nil。`sanitize.go` 的 `sanitizeAttrs` 中：
+
+```go
+if ap.regexp != nil {
+    if ap.regexp.MatchString(htmlAttr.Val) { ... }
+} else {
+    cleanAttrs = append(cleanAttrs, htmlAttr)  // 直接保留，不检查值
+}
+```
+
+所以第 2 层对 `<ol start="任意字符串">` 都会放行。
+
+**但 `start` 值受上游约束，不会出现非数字值**：
+
+| 输入路径 | 第 1 层约束 | 到达第 2 层时的状态 | 第 2 层行为 |
+|---------|---------|---------|---------|
+| Markdown 有序列表 `3. item` | goldmark `renderList`：**`if n.IsOrdered() && n.Start != 1`** 才输出 `start` 属性（`fmt.Fprintf(w, " start=\"%d\"", n.Start)`），`n.Start` 是 `int` 类型，`%d` 格式化强制为整数（见 goldmark v1.7.4 `renderer/html/html.go`） | 纯数字 start 值（Start≠1）或无 start 属性（Start==1） | `AllowAttrs("start").OnElements("ol")` 未调用 `.Matching()`，`ap.regexp == nil`，**直接保留不校验值**（但值已被上游约束为纯整数） |
+| RawHTML `<ol start="abc">` | 第 1a 层默认 UGCPolicy 的 `AllowLists()` 只允许 `ol`/`ul` 的 `type` 属性、`li` 的 `value` 属性，**未允许 `start`**——start 属性被移除 | 属性已不存在 | 无需处理 |
+| HTMLBlock `<ol start="abc">` | 第 1b 层 `SecureWrite` 将整个内容转义为文本 `&lt;ol start=&quot;abc&quot;&gt;` | 文本化，无真实标签 | 无需处理 |
+
+### 3.5 异常链接过滤边界：javascript: 等危险协议能否绕过多层过滤
+
+**结论：异常 href（`javascript:`、`data:`、`vbscript:` 等）无法绕过多层过滤到达可执行 DOM。**
+
+异常 href 的三条输入路径分析：
+
+**路径 A：Markdown 链接 `[text](javascript:alert(1))`**
+- goldmark [renderLink](file:///d:/fz/0601-2/solo-dogfeeding/code/16-answer/pkg/converter/markdown.go#L136-L158) 调用 `renderLinkIsUrl("javascript:alert(1)")`
+- `govalidator.IsURL("javascript:alert(1)")` 返回 **false**，三步校验均不通过：
+  - **第一步（前置过滤）**：`str == ""` → false；`strings.HasPrefix(str, ".")` → false；`http//`/`https//`/`ftp//` 等前缀黑名单不匹配 → 通过
+  - **第二步（url.Parse 探测）**：`url.Parse("javascript:alert(1)")` 解析出 scheme=`javascript`、opaque=`alert(1)`，host 为空；由于 `strTemp` 含 `:` 但不含 `://`，会被前缀 `http://` 后再解析，host 仍为空（`u.Host == ""` 且 `u.Path` 不含 `.` → false）
+  - **第三步（rxURL 正则匹配）**：`URLScheme = ((ftp|tcp|udp|wss?)://)` 只允许这些 scheme 后跟 `://`，`javascript:` 不匹配 → **false**
+- 不以 `/` 开头
+- `renderLinkIsUrl` 返回 false → **不渲染 `<a>` 标签**，输出纯文本 `[text](javascript:alert(1))`
+- 到第 2 层时不含任何 `<a>`，bluemonday 无需处理
+
+**路径 B：RawHTML `<a href="javascript:alert(1)">click</a>`**
+- 第 1a 层默认 UGCPolicy（`requireParseableURLs=true` + `AllowURLSchemes("mailto","http","https")`）
+- `sanitizeAttrs` 进入 `if p.requireParseableURLs { ... }` 块，调用 `validURL("javascript:alert(1)")`
+- `url.Parse("javascript:alert(1)")` 解析出 scheme=`javascript`，但 `javascript` 不在 `allowURLSchemes` 白名单中
+- `validURL` 返回 false → **href 属性被移除**（`<a>` 标签保留但无 href）
+- 输出：`<a rel="nofollow">click</a>`（默认 UGCPolicy 加 nofollow）
+- 第 2 层放宽版 UGCPolicy：`<a>` 仍被允许，但 href 已不存在，无法再生
+
+**路径 C：HTMLBlock `<a href="javascript:alert(1)">click</a>`**
+- 第 1b 层 [renderHTMLBlock](file:///d:/fz/0601-2/solo-dogfeeding/code/16-answer/pkg/converter/markdown.go#L121-L134) 调用 `SecureWrite`
+- 整个内容转义为 `&lt;a href=&quot;javascript:alert(1)&quot;&gt;click&lt;/a&gt;`
+- **完全文本化**，浏览器显示为可见文本而非 DOM 元素
+
+**补充：goldmark `renderLink` 的第二道防线**
+即使 `renderLinkIsUrl` 通过了（例如某些构造的 URL 绕过 `govalidator.IsURL`），[renderLink](file:///d:/fz/0601-2/solo-dogfeeding/code/16-answer/pkg/converter/markdown.go#L141-L143) 还有 `IsDangerousURL` 检查：
+
+```go
+if r.Unsafe || !goldmarkHTML.IsDangerousURL(n.Destination) {
+    _, _ = w.Write(util.EscapeHTML(util.URLEscape(n.Destination, true)))
+}
+```
+
+`IsDangerousURL` 拦截 `javascript:`、`vbscript:`、`data:` 等危险协议。注意 `renderAutoLink` 没有此检查，但其 `renderLinkIsUrl` 同样会拦截无 host 的 `javascript:` 协议。
+
+**异常 href 多层过滤汇总表**：
+
+| 输入路径 | 第 1 层拦截点 | 拦截机制 | 到达第 2 层时的状态 | 第 2 层是否需处理 |
+|---------|---------|---------|---------|---------|
+| 路径 A：Markdown `[text](javascript:...)` | `renderLinkIsUrl` → `govalidator.IsURL` | rxURL 正则不匹配 `javascript:` scheme | 不生成 `<a>` 标签，输出纯文本 | 否（无 `<a>` 可处理） |
+| 路径 B：RawHTML `<a href="javascript:...">` | `sanitizeAttrs` → `validURL` + `allowURLSchemes` | `javascript` 不在 `mailto`/`http`/`https` 白名单 | href 属性被移除，`<a>` 无 href | 否（href 已不存在） |
+| 路径 C：HTMLBlock `<a href="javascript:...">` | `SecureWrite` | HTML 实体转义 | 完全文本化，无 DOM 元素 | 否（无标签可处理） |
+
+**防御纵深关键**：第 2 层 `RequireParseableURLs(false)` 同时取消了 URL 可解析性校验和 scheme 白名单，理论上存在缺口。但异常 href 在三条输入路径中均被第 1 层拦截（路径 A/C 在 goldmark 层、路径 B 在第 1a 层），**到达第 2 层时已不含可执行的异常 href**，因此放宽不会产生实际风险。
+
+### 3.6 放宽限制的实际风险总结
+
+| 放宽项 | 理论风险 | 实际是否受控 | 受控原因 |
+|--------|---------|------------|---------|
+| `RequireNoFollowOnLinks(false)` | 外链丢失 nofollow，SEO 权重流失 | 是（非安全问题） | 前端 [htmlRender](file:///d:/fz/0601-2/solo-dogfeeding/code/16-answer/ui/src/components/Editor/utils/index.ts#L74-L81) 对外链补 nofollow |
+| `RequireParseableURLs(false)` | 第 2 层不再校验 URL scheme，`javascript:` 等 href 理论上可通过 | 是 | 异常 href 在 goldmark 层（路径 A/C）或第 1a 层（路径 B）已被拦截，到不了第 2 层 |
+| `AllowStyling()` 放行 `class` | 用户可注入任意 class 名 | 是 | class 值受 `SpaceSeparatedTokens` 正则约束（`^([\s\p{L}\p{N}_-]+)$`），且 `style` 属性仍被移除 |
+| `AllowAttrs("start")` 无 Matching | `<ol start="恶意值">` 理论上可通过第 2 层 | 是 | Markdown 语法路径受 goldmark int 类型约束；RawHTML 路径被第 1a 层移除 |
+
+### 3.7 Markdown2BasicHTML（更严格的子集）
 **代码位置**：[markdown.go:68-77](file:///d:/fz/0601-2/solo-dogfeeding/code/16-answer/pkg/converter/markdown.go#L68-L77)
 
 用于用户简介（Bio）等场景，先用 `Markdown2HTML` 转换，再用全新的空白策略二次过滤：
@@ -309,11 +398,11 @@ const useRenderHtmlPlugin = (element: HTMLElement | RefObject<HTMLElement> | nul
 
 | 层级 | 位置 | 防护机制 | 降低的风险 | 引入的放宽 |
 |------|------|---------|-----------|-----------|
-| 1a | `renderRawHTML` | 默认 UGCPolicy 逐段过滤（nofollow=true, ParseableURLs=true） | 内联 `<script>`、危险标签、危险属性、不可解析 URL | `<kbd>` 原样放行（低风险） |
+| 1a | `renderRawHTML` | 默认 UGCPolicy 逐段过滤（nofollow=true, ParseableURLs=true, scheme 白名单, **不允许 class/style**） | 内联 `<script>`、危险标签、`class`/`style` 等非白名单属性、不可解析 URL、`javascript:` 等 scheme | `<kbd>` 原样放行（低风险） |
 | 1b | `renderHTMLBlock` | `SecureWrite` HTML 实体转义 | 块级原始 HTML 完全文本化，不可能执行 | 无 |
 | 1c | `renderLink` | IsURL + IsDangerousURL + EscapeHTML + URLEscape | `javascript:` 等危险协议、href 注入 | 无 |
 | 1d | `renderAutoLink` | IsURL + EscapeHTML + URLEscape（无 IsDangerousURL） | 格式非法 URL、href 注入 | 缺少 IsDangerousURL，由 govalidator.IsURL 兜底 |
-| 2 | Bluemonday 放宽版 UGCPolicy | 标签白名单 + 属性白名单 + 正则约束 | 漏过第 1 层的危险标签/属性 | 取消 nofollow、取消 URL 解析校验、允许 style 属性 |
+| 2 | Bluemonday 放宽版 UGCPolicy | 标签白名单 + 属性白名单 + 正则约束 | 漏过第 1 层的危险标签/属性 | 取消 nofollow（前端补）、取消 URL 解析+scheme 校验（异常 href 到不了第 2 层）、**新增放行 `class`**（供 goldmark 代码块语言标记；RawHTML 的 class 已被 1a 层移除；**仍不放行 `style`**） |
 | 3 | `UpdateQuestionLink` | 验证 ID 存在后才替换链接、href 服务端格式化 | 伪造站内链接 ID、href 注入 | 无 |
 | 4 | ReviewService | 内容审核打标，非 Approved 不展示 | 垃圾/违规内容对外暴露 | 无 |
 | 5 | `dangerouslySetInnerHTML` | 只渲染后端 ParsedText | 前端自行拼接 HTML 导致的注入 | 无 |
