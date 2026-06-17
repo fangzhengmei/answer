@@ -30,16 +30,24 @@ type Cache interface {
 
 ### 1.3 缓存键规范
 
-所有缓存键统一在 [internal/base/constant/cache_key.go](file:///d:/fz/0601-2/solo-dogfeeding/code/17-answer/internal/base/constant/cache_key.go) 中定义，采用 `answer:模块:业务:标识` 格式：
+所有缓存键统一在 [internal/base/constant/cache_key.go](file:///d:/fz/0601-2/solo-dogfeeding/code/17-answer/internal/base/constant/cache_key.go#L24-L54) 中定义，采用 `answer:模块:业务:标识` 格式：
 
-| 缓存键前缀 | 用途 | TTL |
-|-----------|------|-----|
-| `answer:config:id:` | 配置ID到内容映射 | 1小时 |
-| `answer:config:key:` | 配置Key到内容映射 | 1小时 |
-| `answer:site-info:` | 站点信息 | 1小时 |
-| `answer:sitemap:question:%d` | Sitemap分页数据 | 1小时 |
-| `answer:user:token:` | 用户登录Token | 7天 |
-| `answer:red-dot:%s:%s` | 通知红点计数 | 30天 |
+| 缓存键常量 | 实际前缀 | 用途 | TTL |
+|-----------|---------|------|-----|
+| `UserTokenCacheKey` | `answer:user:token:` | 用户登录 access token → 用户缓存信息 | 7天 |
+| `UserVisitTokenCacheKey` | `answer:user:visit:` | 访客 visit token → access token 映射 | 7天 |
+| `UserTokenMappingCacheKey` | `answer:user-token:mapping:` | 用户ID → access token 列表映射（用于批量登出） | 7天 |
+| `UserStatusChangedCacheKey` | `answer:user:status:` | 用户状态变更标记（封禁/角色变更等） | 7天 |
+| `AdminTokenCacheKey` | `answer:admin:token:` | 管理员后台 access token → 用户缓存信息 | 7天 |
+| `ConfigID2KEYCacheKeyPrefix` | `answer:config:id:` | 配置ID → 配置内容映射 | 1小时 |
+| `ConfigKEY2ContentCacheKeyPrefix` | `answer:config:key:` | 配置Key → 配置内容映射 | 1小时 |
+| `SiteInfoCacheKey` | `answer:site-info:` | 站点信息 | 1小时 |
+| `SiteMapQuestionCacheKeyPrefix` | `answer:sitemap:question:%d` | Sitemap分页数据 | 1小时 |
+| `RedDotCacheKey` | `answer:red-dot:%s:%s` | 通知红点/徽章成就计数 | 30天 |
+| `RateLimitCacheKeyPrefix` | `answer:rate-limit:` | 接口限流计数 | 5分钟 |
+| `UserEmailCodeCacheKey` | `answer:user:email-code:` | 邮箱验证码 → 验证内容 | 10分钟 |
+| `UserLatestEmailCodeCacheKey` | `answer:user-id:email-code:` | 用户ID → 最新验证码 | 10分钟 |
+| `ConnectorUserExternalInfoCacheKey` | `answer:connector:` | 第三方登录用户信息 | 10分钟 |
 
 ---
 
@@ -227,19 +235,24 @@ func (cr configRepo) UpdateConfig(ctx context.Context, key string, value string)
 
 ```go
 func (ns *NotificationCommon) DeleteRedDot(ctx context.Context, userID string, notificationType int) error {
-    key := fmt.Sprintf(constant.RedDotCacheKey, notificationType, userID)
-    return ns.data.Cache.Del(ctx, key)  // 直接删除缓存
+    var key string
+    if notificationType == schema.NotificationTypeInbox {
+        key = fmt.Sprintf(constant.RedDotCacheKey, constant.NotificationTypeInbox, userID)
+    } else {
+        key = fmt.Sprintf(constant.RedDotCacheKey, constant.NotificationTypeAchievement, userID)
+    }
+    return ns.data.Cache.Del(ctx, key)  // answer:red-dot:{type}:{userID}
 }
 ```
 
-**适用场景**：红点计数实时性要求高，且可能被并发修改，删除缓存比更新更安全。
+**适用场景**：红点计数实时性要求高，且可能被并发修改，删除缓存比更新更安全。key 格式为 `answer:red-dot:{notificationType}:{userID}`。
 
 ### 3.4 徽章成就缓存：读写结合
 
 [internal/service/notification_common/notification.go](file:///d:/fz/0601-2/solo-dogfeeding/code/17-answer/internal/service/notification_common/notification.go#L284-L325)：
 
-- `AddBadgeAwardAlertCache`：读-改-写模式，先查缓存，修改后回写
-- `RemoveBadgeAwardAlertCache`：列表为空时主动删除缓存
+- `AddBadgeAwardAlertCache`：读-改-写模式，先查缓存，修改后回写。key 同样使用 `RedDotCacheKey`，notificationType 取 `NotificationTypeBadgeAchievement`。
+- `RemoveBadgeAwardAlertCache`：移除徽章项后，若列表为空则调用 `Cache.Del` 删除整个 key；否则回写更新后的列表。
 
 ---
 
