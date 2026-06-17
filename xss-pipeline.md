@@ -163,10 +163,10 @@ bluemonday 内置的 UGC 策略默认配置：
 
 | 配置 | 效果 | 风险评估 |
 |------|------|---------|
-| `AllowStyling()` | 允许所有元素携带 `style` 属性，且不限制 CSS 属性范围 | **显著放宽**。UGCPolicy 默认禁止 style。bluemonday 文档明确警告"you should not allow the style attribute anywhere"。虽然现代浏览器已无法通过 CSS 执行 JS，但 `style` 仍可用于 UI 遮盖（overlay）、页面重排等视觉攻击 |
+| `AllowStyling()` | **仅放行 `class` 属性**（全局，值须匹配 `SpaceSeparatedTokens`）。**不放行 `style`** | 常见误读：`AllowStyling()` 不等于允许 `style` 属性。bluemonday v1.0.27 的 `AllowStyling()` 实现只调用 `AllowAttrs("class").Matching(SpaceSeparatedTokens).Globally()`，源码注释明确说"当 bluemonday 内置 CSS 解析器后才会允许受控的 style 属性"。因此 `style` 属性在 UGCPolicy 与本项目策略下**均被移除**，用户无法通过 `style` 注入 CSS |
 | `AllowElements("kbd")` | 额外放行 `<kbd>` | 低风险。kbd 标签无安全隐患 |
-| `AllowAttrs("title").Matching(regex).Globally()` | 全局允许 `title` 属性，值必须匹配 `^[\p{L}\p{N}\s\-_',\[\]!\./\\\(\)]*$` 或 `^@embed?$` | **叠加规则**。UGCPolicy 通过 `AllowStandardAttributes()` 已允许 `title`（含自己的正则约束）。此调用在 bluemonday 中是**追加**而非替换——`title` 值只要匹配 UGCPolicy 原有正则**或**此新增正则即可通过。新增正则的真正作用是放行 `@embed?` 值供 Embed 插件使用 |
-| `AllowAttrs("start").OnElements("ol")` | 允许 `<ol start="...">` | 低风险。start 属性仅接受数字 |
+| `AllowAttrs("title").Matching(regex).Globally()` | 全局允许 `title` 属性，值必须匹配 `^[\p{L}\p{N}\s\-_',\[\]!\./\\\(\)]*$` 或 `^@embed?$` | **叠加规则**。UGCPolicy 通过 `AllowStandardAttributes()` 已允许 `title`（含自己的正则约束 `Paragraph`）。此调用在 bluemonday 中是**追加**而非替换——`title` 值只要匹配 UGCPolicy 原有正则**或**此新增正则即可通过。新增正则的真正作用是放行 `@embed?` 值供 Embed 插件使用 |
+| `AllowAttrs("start").OnElements("ol")` | 允许 `<ol start="...">`，**未调用 `.Matching()`，bluemonday 不校验 start 值** | 实际安全。详见下方"属性值约束"分析 |
 
 ### 3.4 Markdown2BasicHTML（更严格的子集）
 **代码位置**：[markdown.go:68-77](file:///d:/fz/0601-2/solo-dogfeeding/code/16-answer/pkg/converter/markdown.go#L68-L77)
