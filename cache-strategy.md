@@ -85,26 +85,83 @@ func (cr configRepo) GetConfigByKey(ctx context.Context, key string) (c *entity.
 - 缓存序列化使用 JSON，反序列化失败降级到 DB
 - `getCache`/`setCache` 封装为独立方法，便于统一处理
 
-### 2.3 Sitemap 列表缓存命中
+### 2.3 核心列表页（问题/标签分页）：不使用缓存
+
+需要特别指出，**核心业务列表页和详情页均不使用缓存**，每次请求直接查询数据库：
+
+**问题列表分页** [internal/repo/question/question_repo.go](file:///d:/fz/0601-2/solo-dogfeeding/code/17-answer/internal/repo/question/question_repo.go#L394-L457) 的 `GetQuestionPage` 方法：
+
+```go
+func (qr *questionRepo) GetQuestionPage(ctx context.Context, page, pageSize int,
+    tagIDs []string, userID, orderCond string, inDays int, showHidden, showPending bool) (
+    questionList []*entity.Question, total int64, err error) {
+    
+    questionList = make([]*entity.Question, 0)
+    session := qr.data.DB.Context(ctx)
+    // ... 构建复杂查询条件（标签过滤、时间范围、多种排序）
+    total, err = pager.Help(page, pageSize, &questionList, &entity.Question{}, session)
+    return questionList, total, err
+}
+```
+
+**标签列表分页** [internal/service/tag_common/tag_common.go](file:///d:/fz/0601-2/solo-dogfeeding/code/17-answer/internal/service/tag_common/tag_common.go#L427-L433) 的 `GetTagPage` 方法同样直接查 DB。
+
+**不缓存的原因**：
+- 查询维度多（标签过滤、排序方式、时间范围、用户维度等组合爆炸），缓存键管理困难
+- 数据实时性要求高，用户发布/操作后需要立即看到变化
+- 写操作频繁（投票、回答等都会影响排序），写时失效成本高
+
+### 2.4 详情页（问题/回答详情）：不使用缓存
+
+**问题详情** [internal/service/question_common/question.go](file:///d:/fz/0601-2/solo-dogfeeding/code/17-answer/internal/service/question_common/question.go#L254-L362) 的 `Info` 方法：
+
+```go
+func (qs *QuestionCommon) Info(ctx context.Context, questionID string, loginUserID string) (
+    resp *schema.QuestionInfoResp, err error) {
+    
+    questionInfo, has, err := qs.questionRepo.GetQuestion(ctx, questionID)  // 直接查DB
+    if !has {
+        return resp, errors.NotFound(reason.QuestionNotFound)
+    }
+    resp = qs.ShowFormat(ctx, questionInfo)
+    // ... 组装标签、用户信息、投票状态、关注状态、回答状态、收藏状态
+    return resp, nil
+}
+```
+
+**回答详情** [internal/service/content/answer_service.go](file:///d:/fz/0601-2/solo-dogfeeding/code/17-answer/internal/service/content/answer_service.go#L599-L609) 的 `GetDetail` 方法同样直接查 DB。
+
+**不缓存的原因**：
+- 详情页包含大量用户个性化数据（投票状态、关注状态、收藏状态），与登录用户绑定
+- 问题/回答内容可能被编辑，需要保证实时性
+- 查询路径上还有 DB 层（XORM）的会话缓存，能提供一定的性能优化
+
+### 2.5 Sitemap 列表缓存命中
 
 [internal/repo/question/question_repo.go](file:///d:/fz/0601-2/solo-dogfeeding/code/17-answer/internal/repo/question/question_repo.go#L345-L392) 中 `SitemapQuestions` 实现：
 
 ```go
 func (qr *questionRepo) SitemapQuestions(ctx context.Context, page, pageSize int) (
     questionIDList []*schema.SiteMapQuestionInfo, err error) {
+    page--
+    questionIDList = make([]*schema.SiteMapQuestionInfo, 0)  // 初始化空切片
     
+    // try to get sitemap data from cache
     cacheKey := fmt.Sprintf(constant.SiteMapQuestionCacheKeyPrefix, page)
     cacheData, exist, err := qr.data.Cache.GetString(ctx, cacheKey)
     if err == nil && exist {
-        _ = json.Unmarshal([]byte(cacheData), &questionIDList)
-        return questionIDList, nil  // 缓存命中直接返回
+        _ = json.Unmarshal([]byte(cacheData), &questionIDList)  // 用下划线忽略错误
+        return questionIDList, nil  // ⚠️ 反序列化失败也直接返回
     }
     
     // 查DB并组装数据...
     
     // 回写缓存
     cacheDataByte, _ := json.Marshal(questionIDList)
-    qr.data.Cache.SetString(ctx, cacheKey, string(cacheDataByte), constant.SiteMapQuestionCacheTime)
+    if err := qr.data.Cache.SetString(ctx, cacheKey, string(cacheDataByte), 
+        constant.SiteMapQuestionCacheTime); err != nil {
+        log.Error(err)
+    }
     return questionIDList, nil
 }
 ```
@@ -112,9 +169,10 @@ func (qr *questionRepo) SitemapQuestions(ctx context.Context, page, pageSize int
 **要点**：
 - 按页码分片缓存，避免单条缓存过大
 - 缓存有效期 1 小时，由定时任务 `SitemapCron` 主动预热
-- 反序列化出错不返回错误，继续走 DB 查询
+- **反序列化失败处理**：`_ = json.Unmarshal(...)` 用下划线丢弃错误。如果缓存数据损坏或格式不兼容，不会降级到 DB，而是返回初始化的空切片（`[]*schema.SiteMapQuestionInfo{}`），同时 `err=nil`。调用方会得到一个空列表而非错误。
+- **写时不失效**：问题创建/更新/删除时不会主动删除 Sitemap 缓存，完全依赖 TTL 自动过期（1小时）和定时任务预热。
 
-### 2.4 仪表盘统计缓存命中
+### 2.6 仪表盘统计缓存命中
 
 [internal/service/dashboard/dashboard_service.go](file:///d:/fz/0601-2/solo-dogfeeding/code/17-answer/internal/service/dashboard/dashboard_service.go#L102-L173) 中 `Statistical` 实现：
 
@@ -122,7 +180,7 @@ func (qr *questionRepo) SitemapQuestions(ctx context.Context, page, pageSize int
 - 部分字段（回答数、评论数、用户数等）走缓存
 - 采用**部分缓存**策略，平衡实时性与性能
 
-### 2.5 通知红点缓存命中
+### 2.7 通知红点缓存命中
 
 [internal/service/notification_common/notification.go](file:///d:/fz/0601-2/solo-dogfeeding/code/17-answer/internal/service/notification_common/notification.go#L270-L325) 中红点计数缓存：
 
@@ -185,11 +243,44 @@ func (ns *NotificationCommon) DeleteRedDot(ctx context.Context, userID string, n
 
 ---
 
-## 四、失效广播与事件监听机制
+## 四、事件广播、索引刷新与缓存失效的区分
 
-系统通过**异步队列** + **事件驱动** 实现跨模块缓存失效和数据同步。
+用户写入操作后，系统会触发三类完全不同的动作，必须严格区分：
 
-### 4.1 通用队列框架
+| 机制 | 目的 | 操作对象 | 执行时机 |
+|------|------|---------|---------|
+| **缓存失效（Cache.Del）** | 删除陈旧缓存键，下次查询回源DB | 内存/Redis缓存键 | **同步**，写DB后立即执行 |
+| **事件广播（Event 队列）** | 通知其他模块发生了某业务事件 | 业务事件消息 | **异步**，放入队列后返回 |
+| **索引刷新（VectorSync 队列）** | 保持向量搜索索引与DB一致 | 向量搜索插件索引 | **异步**，放入队列+3次重试 |
+
+### 4.1 缓存失效：同步删除缓存键
+
+缓存失效通过 `Cache.Del(ctx, key)` **同步**执行，仅针对明确使用了缓存的业务场景。
+
+搜索全局 `Cache.Del` 调用发现，缓存失效仅用于以下场景：
+
+| 场景 | 代码位置 | 缓存键 |
+|------|---------|--------|
+| 删除通知红点 | [notification.go:277](file:///d:/fz/0601-2/solo-dogfeeding/code/17-answer/internal/service/notification_common/notification.go#L277) | `answer:red-dot:%d:%s` |
+| 移除徽章缓存 | [notification.go:322](file:///d:/fz/0601-2/solo-dogfeeding/code/17-answer/internal/service/notification_common/notification.go#L322) | `answer:badge-award:%s` |
+| 清理限流记录 | [limit.go:64](file:///d:/fz/0601-2/solo-dogfeeding/code/17-answer/internal/repo/limit/limit.go#L64) | `answer:limit:%s` |
+| 删除邮箱验证码 | [email_repo.go:75](file:///d:/fz/0601-2/solo-dogfeeding/code/17-answer/internal/repo/export/email_repo.go#L75) | `answer:user:email:code:%s` |
+| 删除操作频率记录 | [captcha.go:83](file:///d:/fz/0601-2/solo-dogfeeding/code/17-answer/internal/repo/captcha/captcha.go#L83) | `ActionRecord:%s` |
+| 删除验证码 | [captcha.go:112](file:///d:/fz/0601-2/solo-dogfeeding/code/17-answer/internal/repo/captcha/captcha.go#L112) | `answer:captcha:%s` |
+| 用户登出（删除Token） | [auth.go:102](file:///d:/fz/0601-2/solo-dogfeeding/code/17-answer/internal/repo/auth/auth.go#L102) | `answer:user:token:%s` |
+| 删除用户状态缓存 | [auth.go:148](file:///d:/fz/0601-2/solo-dogfeeding/code/17-answer/internal/repo/auth/auth.go#L148) | `answer:user:status-changed:%s` |
+| 管理员登出 | [auth.go:187](file:///d:/fz/0601-2/solo-dogfeeding/code/17-answer/internal/repo/auth/auth.go#L187) | `answer:admin:token:%s` |
+
+**重要结论**：
+- 问题创建/更新/删除、回答创建/更新/删除等核心业务写操作 **不会** 触发 `Cache.Del`，因为核心列表页和详情页根本没有做缓存。
+- Sitemap 缓存也 **不会** 写时失效，完全依赖 TTL（1小时）自动过期。
+- 配置和站点信息使用的是 **Write-Through**（写时更新）而非写时失效。
+
+### 4.2 事件广播：异步通知各业务模块
+
+系统通过**异步队列** + **事件驱动** 实现跨模块数据同步。
+
+#### 4.2.1 通用队列框架
 
 [internal/base/queue/queue.go](file:///d:/fz/0601-2/solo-dogfeeding/code/17-answer/internal/base/queue/queue.go#L40-L130) 提供泛型队列实现：
 
@@ -211,7 +302,7 @@ type Queue[T any] struct {
 - 错误隔离：单条消息处理失败不影响其他消息
 - 处理上下文：使用 `context.TODO()` 确保异步处理不被请求上下文取消
 
-### 4.2 四类专用队列
+#### 4.2.2 四类专用队列
 
 系统在 [internal/service/provider.go](file:///d:/fz/0601-2/solo-dogfeeding/code/17-answer/internal/service/provider.go#L122-L140) 初始化四类队列：
 
@@ -222,7 +313,7 @@ type Queue[T any] struct {
 | Notification 队列 | [noticequeue/notice_queue.go](file:///d:/fz/0601-2/solo-dogfeeding/code/17-answer/internal/service/noticequeue/notice_queue.go) | `*schema.NotificationMsg` | 站内通知 |
 | VectorSync 队列 | [vector_sync/vector_sync.go](file:///d:/fz/0601-2/solo-dogfeeding/code/17-answer/internal/service/vector_sync/vector_sync.go) | `*Task` | 向量搜索索引同步 |
 
-### 4.3 事件类型定义
+#### 4.2.3 事件类型定义
 
 [internal/base/constant/event.go](file:///d:/fz/0601-2/solo-dogfeeding/code/17-answer/internal/base/constant/event.go) 定义了完整的事件类型，采用 `对象.动作` 格式：
 
@@ -240,7 +331,7 @@ const (
 )
 ```
 
-### 4.4 事件广播流程
+#### 4.2.4 事件广播流程
 
 以问题创建为例，[internal/service/content/question_service.go](file:///d:/fz/0601-2/solo-dogfeeding/code/17-answer/internal/service/content/question_service.go#L442-L465)：
 
@@ -283,7 +374,7 @@ type EventMsg struct {
 }
 ```
 
-### 4.5 事件监听与处理器注册
+#### 4.2.5 事件监听与处理器注册
 
 通过 `RegisterHandler` 注册处理器，以徽章事件为例 [internal/service/badge/badge_event_handler.go](file:///d:/fz/0601-2/solo-dogfeeding/code/17-answer/internal/service/badge/badge_event_handler.go#L46-L77)：
 
@@ -419,7 +510,7 @@ return c, err
 
 - **空值不缓存**：数据库查询结果不存在时不写入缓存（由业务代码控制）
 - **有效性校验**：缓存读取后校验关键字段（如 `c.ID > 0`），无效则穿透到 DB
-- **JSON 容错**：反序列化失败不抛出错误，继续走 DB 查询
+- **JSON 容错**：反序列化失败不抛出错误，继续走 DB 查询（注意：Sitemap 除外，其反序列化失败返回空列表而非降级DB）
 
 ### 5.4 缓存预热机制
 
@@ -438,30 +529,45 @@ func (qs *QuestionCommon) SitemapCron(ctx context.Context) {
 
 ---
 
-## 六、核心业务写操作完整链路
+## 六、核心业务写操作完整链路（区分三类机制）
 
-以**删除问题**为例，完整链路如下 [internal/service/content/question_service.go](file:///d:/fz/0601-2/solo-dogfeeding/code/17-answer/internal/service/content/question_service.go#L556-L664)：
+以**删除问题**为例 [internal/service/content/question_service.go](file:///d:/fz/0601-2/solo-dogfeeding/code/17-answer/internal/service/content/question_service.go#L556-L664)，链路中标注了每一步属于哪类机制：
 
 ```
 用户请求删除问题
     ↓
 1. 权限校验（是否作者/管理员、是否有采纳回答等）
     ↓
-2. 更新数据库问题状态为已删除
+2. 【同步】更新数据库问题状态为已删除（DB 写操作）
     ↓
-3. 更新关联数据计数（用户问题数、标签问题数）
+3. 【同步】更新关联数据：用户问题数、标签关联、标签问题数计数
     ↓
-4. 发送活动消息 → Activity 队列 → 写入活动记录
+4. 【同步】⚠️ 注意：此处**没有**调用 Cache.Del 做缓存失效
     ↓
-5. 发送事件广播 → Event 队列 → 徽章判定、其他监听
+5. 【异步→事件广播】发送活动消息 → Activity 队列 → 写入活动记录/声望计算
     ↓
-6. 发送向量同步 → VectorSync 队列 → 删除向量索引（带重试）
+6. 【异步→事件广播】发送事件广播 → Event 队列 → 徽章判定、其他模块监听
+    ↓
+7. 【异步→索引刷新】发送向量同步 → VectorSync 队列 → 删除向量索引（3次重试）
     ↓
 返回成功
 ```
 
+**三类机制对比（以删除问题为例）**：
+
+| 步骤 | 机制类型 | 是否同步 | 代码实现 | 失败影响 |
+|------|---------|---------|---------|---------|
+| 2 | DB写入 | 同步 | `questionRepo.UpdateQuestionStatusWithOutUpdateTime` | 请求失败，返回错误 |
+| 3 | DB写入 | 同步 | `userCommon.UpdateQuestionCount`, `tagCommon.RemoveTagRelListByObjectID` | 请求失败，回滚失败 |
+| 4 | **缓存失效** | — | **未执行**（无相关缓存） | 无影响，核心列表/详情不缓存 |
+| 5 | **事件广播** | 异步 | `activityQueueService.Send` | 活动记录丢失，不影响主流程 |
+| 6 | **事件广播** | 异步 | `eventQueueService.Send(EventQuestionDelete)` | 徽章等未触发，不影响主流程 |
+| 7 | **索引刷新** | 异步+重试 | `vectorSyncService.Send(ActionDelete)` | 搜索索引暂时不一致，3次重试后仍失败则记录日志 |
+
 **关键说明**：
-- 数据库更新是同步的，确保数据一致性
+- 删除问题时 **没有任何缓存失效操作**，因为核心列表页、详情页均不使用缓存
+- Sitemap 缓存不做写时失效，依赖 TTL（1小时）自动过期
+- 数据库更新是同步的，确保核心数据一致性
 - 活动记录、事件广播、索引同步都是异步的，不影响响应时间
 - 各队列相互独立，某一队列阻塞不影响其他
 
@@ -495,9 +601,26 @@ func (qs *QuestionCommon) SitemapCron(ctx context.Context) {
 | 配置缓存 | [config_repo.go](file:///d:/fz/0601-2/solo-dogfeeding/code/17-answer/internal/repo/config/config_repo.go) | `GetConfigByKey`, `UpdateConfig` |
 | 站点信息缓存 | [siteinfo_repo.go](file:///d:/fz/0601-2/solo-dogfeeding/code/17-answer/internal/repo/site_info/siteinfo_repo.go) | `GetByType`, `SaveByType` |
 | Sitemap缓存 | [question_repo.go](file:///d:/fz/0601-2/solo-dogfeeding/code/17-answer/internal/repo/question/question_repo.go) | `SitemapQuestions` |
+| 问题列表（**不缓存**） | [question_repo.go](file:///d:/fz/0601-2/solo-dogfeeding/code/17-answer/internal/repo/question/question_repo.go) | `GetQuestionPage` |
+| 问题详情（**不缓存**） | [question.go](file:///d:/fz/0601-2/solo-dogfeeding/code/17-answer/internal/service/question_common/question.go) | `Info` |
+| 回答详情（**不缓存**） | [answer_service.go](file:///d:/fz/0601-2/solo-dogfeeding/code/17-answer/internal/service/content/answer_service.go) | `GetDetail` |
+| 标签列表（**不缓存**） | [tag_common.go](file:///d:/fz/0601-2/solo-dogfeeding/code/17-answer/internal/service/tag_common/tag_common.go) | `GetTagPage` |
 | 仪表盘缓存 | [dashboard_service.go](file:///d:/fz/0601-2/solo-dogfeeding/code/17-answer/internal/service/dashboard/dashboard_service.go) | `Statistical`, `getFromCache` |
+| 通知红点缓存+失效 | [notification.go](file:///d:/fz/0601-2/solo-dogfeeding/code/17-answer/internal/service/notification_common/notification.go) | `DeleteRedDot` |
 | 通用队列 | [queue.go](file:///d:/fz/0601-2/solo-dogfeeding/code/17-answer/internal/base/queue/queue.go) | `New`, `Send`, `RegisterHandler` |
-| 事件广播 | [question_service.go](file:///d:/fz/0601-2/solo-dogfeeding/code/17-answer/internal/service/content/question_service.go) | `AddQuestion`, `RemoveQuestion` |
-| 向量同步 | [vector_sync.go](file:///d:/fz/0601-2/solo-dogfeeding/code/17-answer/internal/service/vector_sync/vector_sync.go) | `handle`, `handleOnce` |
-| 活动处理 | [activity.go](file:///d:/fz/0601-2/solo-dogfeeding/code/17-answer/internal/service/activity_common/activity.go) | `HandleActivity` |
-| 事件监听 | [badge_event_handler.go](file:///d:/fz/0601-2/solo-dogfeeding/code/17-answer/internal/service/badge/badge_event_handler.go) | `Handler` |
+| 事件广播+索引刷新 | [question_service.go](file:///d:/fz/0601-2/solo-dogfeeding/code/17-answer/internal/service/content/question_service.go) | `AddQuestion`, `RemoveQuestion` |
+| 向量同步（索引刷新） | [vector_sync.go](file:///d:/fz/0601-2/solo-dogfeeding/code/17-answer/internal/service/vector_sync/vector_sync.go) | `handle`, `handleOnce` |
+| 活动处理（事件广播） | [activity.go](file:///d:/fz/0601-2/solo-dogfeeding/code/17-answer/internal/service/activity_common/activity.go) | `HandleActivity` |
+| 徽章监听（事件广播） | [badge_event_handler.go](file:///d:/fz/0601-2/solo-dogfeeding/code/17-answer/internal/service/badge/badge_event_handler.go) | `Handler` |
+
+### 7.4 三类写后机制核心区别（再次强调）
+
+| 维度 | 缓存失效（Cache.Del） | 事件广播（Event/Activity队列） | 索引刷新（VectorSync队列） |
+|------|---------------------|------------------------------|--------------------------|
+| **核心目标** | 删除缓存键，下次查回源DB | 通知其他模块业务事件发生 | 更新向量搜索索引数据 |
+| **执行方式** | **同步**调用 | **异步**入队即返回 | **异步**入队+3次重试 |
+| **操作对象** | `plugin.Cache` 接口 | 业务消息（ActivityMsg/EventMsg） | 向量搜索插件 |
+| **适用数据** | 红点、Token、验证码、徽章等**有缓存的数据** | 活动记录、声望、徽章、通知等**跨模块业务** | 问题/回答的**搜索索引** |
+| **核心业务是否使用** | ❌ 问题/回答写操作**不触发**（无缓存） | ✅ 每次写操作都发送 | ✅ 状态为Available/Deleted时发送 |
+| **Sitemap缓存** | ❌ 写时不失效，靠TTL过期 | — | — |
+| **失败影响** | 下次查询多读一次DB | 活动/徽章/通知可能丢失（无补偿） | 搜索暂时不准（有3次重试） |
