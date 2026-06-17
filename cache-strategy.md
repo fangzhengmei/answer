@@ -257,21 +257,64 @@ func (ns *NotificationCommon) DeleteRedDot(ctx context.Context, userID string, n
 
 缓存失效通过 `Cache.Del(ctx, key)` **同步**执行，仅针对明确使用了缓存的业务场景。
 
-搜索全局 `Cache.Del` 调用发现，缓存失效仅用于以下场景：
+对全局 `Cache.Del` 调用逐一核对源码与 [cache_key.go](file:///d:/fz/0601-2/solo-dogfeeding/code/17-answer/internal/base/constant/cache_key.go#L24-L54) 中的常量定义，完整清单如下（共 12 处）：
 
-| 场景 | 代码位置 | 缓存键 |
-|------|---------|--------|
-| 删除通知红点 | [notification.go:277](file:///d:/fz/0601-2/solo-dogfeeding/code/17-answer/internal/service/notification_common/notification.go#L277) | `answer:red-dot:%d:%s` |
-| 移除徽章缓存 | [notification.go:322](file:///d:/fz/0601-2/solo-dogfeeding/code/17-answer/internal/service/notification_common/notification.go#L322) | `answer:badge-award:%s` |
-| 清理限流记录 | [limit.go:64](file:///d:/fz/0601-2/solo-dogfeeding/code/17-answer/internal/repo/limit/limit.go#L64) | `answer:limit:%s` |
-| 删除邮箱验证码 | [email_repo.go:75](file:///d:/fz/0601-2/solo-dogfeeding/code/17-answer/internal/repo/export/email_repo.go#L75) | `answer:user:email:code:%s` |
-| 删除操作频率记录 | [captcha.go:83](file:///d:/fz/0601-2/solo-dogfeeding/code/17-answer/internal/repo/captcha/captcha.go#L83) | `ActionRecord:%s` |
-| 删除验证码 | [captcha.go:112](file:///d:/fz/0601-2/solo-dogfeeding/code/17-answer/internal/repo/captcha/captcha.go#L112) | `answer:captcha:%s` |
-| 用户登出（删除Token） | [auth.go:102](file:///d:/fz/0601-2/solo-dogfeeding/code/17-answer/internal/repo/auth/auth.go#L102) | `answer:user:token:%s` |
-| 删除用户状态缓存 | [auth.go:148](file:///d:/fz/0601-2/solo-dogfeeding/code/17-answer/internal/repo/auth/auth.go#L148) | `answer:user:status-changed:%s` |
-| 管理员登出 | [auth.go:187](file:///d:/fz/0601-2/solo-dogfeeding/code/17-answer/internal/repo/auth/auth.go#L187) | `answer:admin:token:%s` |
+#### 4.1.1 认证相关（auth.go，5 处）
 
-**重要结论**：
+| 场景 | 代码位置 | 缓存键常量 | 实际 key 格式 |
+|------|---------|-----------|-------------|
+| 用户登出（删除用户Token） | [auth.go:102 `RemoveUserCacheInfo`](file:///d:/fz/0601-2/solo-dogfeeding/code/17-answer/internal/repo/auth/auth.go#L100-L107) | `UserTokenCacheKey` | `answer:user:token:{accessToken}` |
+| 删除访客Token（visit token） | [auth.go:111 `RemoveUserVisitCacheInfo`](file:///d:/fz/0601-2/solo-dogfeeding/code/17-answer/internal/repo/auth/auth.go#L109-L116) | `UserVisitTokenCacheKey` | `answer:user:visit:{visitToken}` |
+| 删除用户状态变更缓存 | [auth.go:148 `RemoveUserStatus`](file:///d:/fz/0601-2/solo-dogfeeding/code/17-answer/internal/repo/auth/auth.go#L146-L153) | `UserStatusChangedCacheKey` | `answer:user:status:{userID}` |
+| 管理员登出（删除后台Token） | [auth.go:187 `RemoveAdminUserCacheInfo`](file:///d:/fz/0601-2/solo-dogfeeding/code/17-answer/internal/repo/auth/auth.go#L185-L192) | `AdminTokenCacheKey` | `answer:admin:token:{accessToken}` |
+| 批量登出用户所有Token后清理映射 | [auth.go:236 `RemoveUserTokens`](file:///d:/fz/0601-2/solo-dogfeeding/code/17-answer/internal/repo/auth/auth.go#L210-L239) | `UserTokenMappingCacheKey` | `answer:user-token:mapping:{userID}` |
+
+**说明**：
+- `RemoveUserVisitCacheInfo` 用于删除 visit token → access token 的映射缓存（见 [SetUserCacheInfo](file:///d:/fz/0601-2/solo-dogfeeding/code/17-answer/internal/repo/auth/auth.go#L62-L86) 中 visit token 的写入逻辑）。
+- `RemoveUserTokens` 是"踢下线"逻辑：先从 `answer:user-token:mapping:{userID}` 读取该用户所有 access token 列表，逐个调用 `RemoveUserCacheInfo` 删除，再删除 `RemoveUserStatus`，最后删除 mapping 本身。
+- 这 5 处全部是认证/会话相关的写时失效，与问题、回答等核心业务写操作无关。
+
+#### 4.1.2 通知与红点（notification.go，2 处）
+
+| 场景 | 代码位置 | 缓存键常量 | 实际 key 格式 |
+|------|---------|-----------|-------------|
+| 删除通知红点计数 | [notification.go:277 `DeleteRedDot`](file:///d:/fz/0601-2/solo-dogfeeding/code/17-answer/internal/service/notification_common/notification.go#L270-L282) | `RedDotCacheKey` | `answer:red-dot:{notificationType}:{userID}` |
+| 移除徽章成就缓存（列表为空时） | [notification.go:322 `RemoveBadgeAwardAlertCache`](file:///d:/fz/0601-2/solo-dogfeeding/code/17-answer/internal/service/notification_common/notification.go#L308-L325) | `RedDotCacheKey` | `answer:red-dot:{NotificationTypeBadgeAchievement}:{userID}` |
+
+**说明**：徽章缓存删除 **同样使用 `RedDotCacheKey`**（`answer:red-dot:%s:%s`），只是 `notificationType` 取值为 `NotificationTypeBadgeAchievement`，并非独立的 `answer:badge-award:` 键。仅当徽章列表移除某项后变为空列表时才执行删除，否则回写更新后的列表。
+
+#### 4.1.3 限流与频率控制（limit.go / captcha.go，3 处）
+
+| 场景 | 代码位置 | 缓存键常量 | 实际 key 格式 |
+|------|---------|-----------|-------------|
+| 清理限流记录 | [limit.go:64 `ClearRecord`](file:///d:/fz/0601-2/solo-dogfeeding/code/17-answer/internal/repo/limit/limit.go#L62-L65) | `RateLimitCacheKeyPrefix` | `answer:rate-limit:{key}` |
+| 删除操作频率记录 | [captcha.go:83 `DelActionType`](file:///d:/fz/0601-2/solo-dogfeeding/code/17-answer/internal/repo/captcha/captcha.go#L80-L88) | 内联格式串 | `ActionRecord:{unit}@{actionType}@{2006-1-02}` |
+| 删除图形验证码 | [captcha.go:112 `DelCaptcha`](file:///d:/fz/0601-2/solo-dogfeeding/code/17-answer/internal/repo/captcha/captcha.go#L111-L117) | 调用方传入的参数 | 由调用方决定的 `{key}` |
+
+**说明**：
+- 限流 key 前缀是 `answer:rate-limit:`（常量 `RateLimitCacheKeyPrefix`），不是 `answer:limit:`。
+- 操作频率记录的 key 是 `ActionRecord:{unit}@{actionType}@{date}` 三段式格式，日期按 `2006-1-02` 格式化，不是单一占位符。
+- 图形验证码删除时 key 由调用方传入，代码中无固定前缀常量。
+
+#### 4.1.4 邮箱验证码（email_repo.go，1 处）
+
+| 场景 | 代码位置 | 缓存键常量 | 实际 key 格式 |
+|------|---------|-----------|-------------|
+| 验证后删除邮箱验证码 | [email_repo.go:75 `VerifyCode`](file:///d:/fz/0601-2/solo-dogfeeding/code/17-answer/internal/repo/export/email_repo.go#L63-L76) | `UserEmailCodeCacheKey` | `answer:user:email-code:{code}` |
+
+**说明**：key 前缀是 `answer:user:email-code:`（常量 `UserEmailCodeCacheKey`），用连字符分隔，不是 `answer:user:email:code:`。
+
+#### 4.1.5 插件 KV 存储（kv_storage.go，1 处）
+
+| 场景 | 代码位置 | 缓存键 | 实际 key 格式 |
+|------|---------|--------|-------------|
+| 插件 KV 存储清理缓存 | [kv_storage.go:132 `cleanCache`](file:///d:/fz/0601-2/solo-dogfeeding/code/17-answer/plugin/kv_storage.go#L127-L135) | `kv.getCacheKey(params)` | 由插件的 `KVParams` 决定 |
+
+**说明**：插件层 KV 存储在写入（Set/Delete）后会调用 `cleanCache` 删除对应缓存，key 由 `getCacheKey` 方法基于 group + key 组装。
+
+#### 4.1.6 重要结论
+
+- 上述 12 处 `Cache.Del` 全部用于认证会话、通知红点、限流验证码、插件 KV 等**辅助系统**数据，与问题/回答/标签等核心业务内容**完全无关**。
 - 问题创建/更新/删除、回答创建/更新/删除等核心业务写操作 **不会** 触发 `Cache.Del`，因为核心列表页和详情页根本没有做缓存。
 - Sitemap 缓存也 **不会** 写时失效，完全依赖 TTL（1小时）自动过期。
 - 配置和站点信息使用的是 **Write-Through**（写时更新）而非写时失效。
