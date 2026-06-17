@@ -29,7 +29,10 @@
 ┌──────────────────────────────────────────────────────────┐
 │  Markdown2HTML 核心管道   [pkg/converter/markdown.go]     │
 │  ┌─ 第1层: Goldmark 解析 + DangerousHTMLRenderer          │
-│  └─ 第2层: Bluemonday UGCPolicy 白名单过滤                 │
+│  │    内含 1a: RawHTML → bluemonday 严格 UGCPolicy 逐段过滤│
+│  │    内含 1b: HTMLBlock → SecureWrite HTML实体转义        │
+│  │    内含 1c: Link/AutoLink → URL合法性 + 危险协议拦截     │
+│  └─ 第2层: Bluemonday 放宽版 UGCPolicy 全局二次过滤         │
 └──────────────────────────────────────────────────────────┘
     │
     ▼ entity.OriginalText + entity.ParsedText
@@ -56,41 +59,80 @@
 
 **代码位置**：[markdown.go:79-189](file:///d:/fz/0601-2/solo-dogfeeding/code/16-answer/pkg/converter/markdown.go#L79-L189)
 
-通过自定义扩展 `DangerousHTMLFilterExtension` 将 `DangerousHTMLRenderer` 注入 goldmark 渲染管线，优先级为 1（最高）。该渲染器针对 4 种 AST 节点做了特殊处理：
+通过自定义扩展 `DangerousHTMLFilterExtension` 将 `DangerousHTMLRenderer` 注入 goldmark 渲染管线，优先级为 1（最高）。该渲染器针对 4 种 AST 节点做了特殊处理。
+
+注意：`DangerousHTMLRenderer` 内部持有一个 `Filter` 字段，它是 **默认 UGCPolicy**（第 86 行 `bluemonday.UGCPolicy()`），没有经过后续的放宽调整。因此第 1 层内部存在**两道不同严格度的 bluemonday 策略**：
+
+| 阶段 | 策略 | 严格度 |
+|------|------|--------|
+| 1a RawHTML 逐段过滤 | `DangerousHTMLRenderer.Filter`（默认 UGCPolicy） | 更严格：nofollow=true，RequireParseableURLs=true |
+| 2 全局二次过滤 | `Markdown2HTML` 局部 filter（放宽版 UGCPolicy） | 较宽松：nofollow=false，RequireParseableURLs=false |
 
 ### 2.1 RawHTML（内联原始 HTML）
 函数：[renderRawHTML](file:///d:/fz/0601-2/solo-dogfeeding/code/16-answer/pkg/converter/markdown.go#L104-L119)
 
 ```go
 if string(segment) == "<kbd>" || string(segment) == "</kbd>" {
-    // <kbd> 标签直接放行（用于键盘按键样式）
     w.Write(segment.Value(source))
 } else {
-    // 其余原始 HTML 片段，用 bluemonday.UGCPolicy() 逐段过滤
     w.Write(r.Filter.SanitizeBytes(segment.Value(source)))
 }
 ```
 
+- `<kbd>` / `</kbd>` 原样放行（键盘按键样式）
+- 其余所有内联 HTML 片段经 `r.Filter.SanitizeBytes()` 过滤——此 `r.Filter` 是**默认 UGCPolicy**，会自动为 `<a>` 加 `rel="nofollow"`、校验 URL 可解析性
+- 放行的 `<kbd>` 在第 2 层还会被 `AllowElements("kbd")` 保留
+
 ### 2.2 HTMLBlock（HTML 块级内容）
 函数：[renderHTMLBlock](file:///d:/fz/0601-2/solo-dogfeeding/code/16-answer/pkg/converter/markdown.go#L121-L134)
 
-使用 `r.Writer.SecureWrite` 写入，这是 goldmark 内置的安全写入方法，会对内容做 HTML 转义。
+```go
+r.Writer.SecureWrite(w, line.Value(source))
+```
 
-### 2.3 Link / AutoLink（链接）
-函数：[renderLink](file:///d:/fz/0601-2/solo-dogfeeding/code/16-answer/pkg/converter/markdown.go#L136-L158)、[renderAutoLink](file:///d:/fz/0601-2/solo-dogfeeding/code/16-answer/pkg/converter/markdown.go#L160-L183)
+`SecureWrite` 是 goldmark `Writer` 接口的方法，官方定义为 **"writes the given source to writer with replacing insecure characters"**（见 goldmark v1.7.4 `renderer/html` 包）。它将 `<`、`>`、`&`、`"` 等字符替换为 HTML 实体（`&lt;`、`&gt;`、`&amp;`、`&quot;`）。
+
+**效果**：所有块级原始 HTML 被彻底**文本化**。例如用户写 `<div class="xss">` 会输出 `&lt;div class=&quot;xss&quot;&gt;`，在浏览器中显示为可见文本而非 DOM 元素。此内容进入第 2 层 bluemonday 时已不含任何真实 HTML 标签，不会被解析执行。
+
+**与 goldmark 默认行为的对比**：
+- goldmark 默认 `renderHTMLBlock`：`Unsafe=false` 时输出 `<!-- raw HTML omitted -->` 注释（完全移除）
+- 项目自定义 `renderHTMLBlock`：始终 `SecureWrite`（转义为可见文本）
+
+项目选择"转义为可见文本"而非"完全移除"，用户能看到自己写了什么，同时保证安全。
+
+### 2.3 Link（Markdown 链接）
+函数：[renderLink](file:///d:/fz/0601-2/solo-dogfeeding/code/16-answer/pkg/converter/markdown.go#L136-L158)
 
 ```go
-// 只在 URL 合法时才渲染 <a> 标签
 if entering && r.renderLinkIsUrl(string(n.Destination)) {
-    // 使用 util.EscapeHTML + util.URLEscape 双重转义 href
-    w.Write(util.EscapeHTML(util.URLEscape(n.Destination, true)))
-    goldmarkHTML.RenderAttributes(w, n, goldmarkHTML.LinkAttributeFilter)
+    _, _ = w.WriteString("<a href=\"")
+    if r.Unsafe || !goldmarkHTML.IsDangerousURL(n.Destination) {
+        _, _ = w.Write(util.EscapeHTML(util.URLEscape(n.Destination, true)))
+    }
+    _ = w.WriteByte('"')
+    // ... title、attributes
 }
 ```
 
-URL 合法性校验：[renderLinkIsUrl](file:///d:/fz/0601-2/solo-dogfeeding/code/16-answer/pkg/converter/markdown.go#L185-L189)
-- 必须是合法 URL（govalidator.IsURL）
-- 或者是以 `/` 开头的站内相对路径
+三道防线：
+1. **`renderLinkIsUrl`**：URL 必须通过 `govalidator.IsURL` 或以 `/` 开头
+2. **`IsDangerousURL`**：拦截 `javascript:`、`vbscript:`、`data:` 等危险协议（`r.Unsafe` 默认 false）
+3. **`util.EscapeHTML(util.URLEscape(...))`**：对 `href` 值做 HTML 实体转义 + URL 编码
+
+注意源码中被注释掉的一行 `// _, _ = w.WriteString("<a test=\"1\" rel=\"nofollow\" href=\"")`——项目**故意不在 goldmark 层添加 nofollow**，将 nofollow 逻辑交给前端。
+
+### 2.4 AutoLink（自动链接）
+函数：[renderAutoLink](file:///d:/fz/0601-2/solo-dogfeeding/code/16-answer/pkg/converter/markdown.go#L160-L183)
+
+```go
+if !entering || !r.renderLinkIsUrl(string(n.URL(source))) {
+    return ast.WalkContinue, nil
+}
+_, _ = w.WriteString(`<a href="`)
+_, _ = w.Write(util.EscapeHTML(util.URLEscape(url, false)))
+```
+
+与 `renderLink` 的区别：**没有 `IsDangerousURL` 检查**。但 `renderLinkIsUrl` 要求 `govalidator.IsURL` 返回 true，该函数对 URL 格式有较严格校验（需要合法 host），`javascript:alert(1)` 等无 host 的危险协议无法通过。此外 `util.EscapeHTML` 会转义引号和尖括号，阻止属性注入。
 
 ---
 
@@ -98,34 +140,38 @@ URL 合法性校验：[renderLinkIsUrl](file:///d:/fz/0601-2/solo-dogfeeding/cod
 
 **代码位置**：[markdown.go:39-66](file:///d:/fz/0601-2/solo-dogfeeding/code/16-answer/pkg/converter/markdown.go#L39-L66)
 
-Goldmark 输出完整 HTML 后，使用 `bluemonday.UGCPolicy()`（User Generated Content 策略）作为基线，在此基础上做白名单的**收紧**与**定向扩展**：
+Goldmark 输出完整 HTML 后，使用 `bluemonday.UGCPolicy()` 作为基线，在此基础上做**放宽**与**定向扩展**：
 
-### 3.1 策略基线（UGCPolicy）
-bluemonday 内置的 UGC 策略默认允许：
-- 标签：`a, b, blockquote, br, caption, cite, code, col, colgroup, dd, del, dfn, dl, dt, em, figcaption, figure, h1-h6, hr, i, img, ins, kbd, li, mark, ol, p, pre, q, rp, rt, ruby, s, samp, small, strike, strong, sub, sup, table, tbody, td, tfoot, th, thead, tr, u, ul`
-- 自动移除 `script, iframe, form, object, embed` 等危险标签
-- 移除 `on*` 事件处理器
-- 默认对所有链接加 `rel="nofollow"`
+### 3.1 策略基线（UGCPolicy 默认值）
+bluemonday 内置的 UGC 策略默认配置：
+- 允许标签：`a, b, blockquote, br, caption, cite, code, col, colgroup, dd, del, dfn, dl, dt, em, figcaption, figure, h1-h6, hr, i, img, ins, kbd, li, mark, ol, p, pre, q, rp, rt, ruby, s, samp, small, strike, strong, sub, sup, table, tbody, td, tfoot, th, thead, tr, u, ul`
+- 移除标签：`script, iframe, form, object, embed, style` 等
+- 移除所有 `on*` 事件处理器
+- **默认 `RequireNoFollowOnLinks(true)`**：所有 `<a>` 自动加 `rel="nofollow"`
+- **默认 `RequireParseableURLs(true)`**：URL 属性值必须可被 `net/url.Parse` 解析
+- **默认不允许 `style` 属性**
 
-### 3.2 收紧配置
-| 配置 | 作用 |
-|------|------|
-| `RequireNoFollowOnLinks(false)` | 不强制所有链接加 nofollow（交给前端 htmlRender 按外链判断） |
-| `RequireParseableURLs(false)` | 不强制 URL 必须可解析（允许相对路径） |
-| `RequireNoFollowOnFullyQualifiedLinks(false)` | 不强制绝对链接加 nofollow |
+### 3.2 放宽配置（在 UGCPolicy 基线上退让）
 
-### 3.3 扩展配置
-| 配置 | 作用 |
-|------|------|
-| `AllowStyling()` | 允许 `style` 属性（用于 Markdown 扩展的行内样式） |
-| `AllowElements("kbd")` | 额外放行 `<kbd>` 标签 |
-| `AllowAttrs("title").Matching(...).Globally()` | 全局允许 `title` 属性，值必须匹配正则 `^[\p{L}\p{N}\s\-_',\[\]!\./\\\(\)]*$` 或 `^@embed?$`（后者用于 Embed 嵌入插件的标记） |
-| `AllowAttrs("start").OnElements("ol")` | 允许 `<ol start="...">` 用于有序列表起始编号 |
+| 配置 | UGCPolicy 默认值 | 项目设置 | 效果 |
+|------|------------------|---------|------|
+| `RequireNoFollowOnLinks(false)` | true（所有链接加 nofollow） | false | **取消**对所有链接强制加 nofollow。后端输出的 `<a>` 不带 nofollow，外链 nofollow 由前端 `htmlRender` 补上 |
+| `RequireNoFollowOnFullyQualifiedLinks(false)` | true（绝对链接加 nofollow） | false | **取消**对绝对链接强制加 nofollow |
+| `RequireParseableURLs(false)` | true（URL 必须可解析） | false | **取消** URL 可解析性校验。不仅允许相对路径，也允许任何无法被 `net/url.Parse` 解析的 `href` 值通过。风险在于 bluemonday 不再拦截格式异常的 URL，但 goldmark 层已对链接做了 `govalidator.IsURL` + `EscapeHTML` 双重防护，所以对 Markdown 链接无实际影响；对 RawHTML 中的链接，第 1 层的默认 UGCPolicy 仍然校验 URL |
+
+### 3.3 扩展配置（在 UGCPolicy 基线上新增能力）
+
+| 配置 | 效果 | 风险评估 |
+|------|------|---------|
+| `AllowStyling()` | 允许所有元素携带 `style` 属性，且不限制 CSS 属性范围 | **显著放宽**。UGCPolicy 默认禁止 style。bluemonday 文档明确警告"you should not allow the style attribute anywhere"。虽然现代浏览器已无法通过 CSS 执行 JS，但 `style` 仍可用于 UI 遮盖（overlay）、页面重排等视觉攻击 |
+| `AllowElements("kbd")` | 额外放行 `<kbd>` | 低风险。kbd 标签无安全隐患 |
+| `AllowAttrs("title").Matching(regex).Globally()` | 全局允许 `title` 属性，值必须匹配 `^[\p{L}\p{N}\s\-_',\[\]!\./\\\(\)]*$` 或 `^@embed?$` | **叠加规则**。UGCPolicy 通过 `AllowStandardAttributes()` 已允许 `title`（含自己的正则约束）。此调用在 bluemonday 中是**追加**而非替换——`title` 值只要匹配 UGCPolicy 原有正则**或**此新增正则即可通过。新增正则的真正作用是放行 `@embed?` 值供 Embed 插件使用 |
+| `AllowAttrs("start").OnElements("ol")` | 允许 `<ol start="...">` | 低风险。start 属性仅接受数字 |
 
 ### 3.4 Markdown2BasicHTML（更严格的子集）
 **代码位置**：[markdown.go:68-77](file:///d:/fz/0601-2/solo-dogfeeding/code/16-answer/pkg/converter/markdown.go#L68-L77)
 
-用于用户简介（Bio）等场景，白名单进一步收紧到：
+用于用户简介（Bio）等场景，先用 `Markdown2HTML` 转换，再用全新的空白策略二次过滤：
 - 仅允许标签：`p, b, br, strong, em`
 - 仅允许 `img[src]`
 - 剥离标签时自动加空格避免文字粘连
@@ -192,25 +238,25 @@ _ = plugin.CallReviewer(func(reviewer plugin.Reviewer) error {
 />
 ```
 
-`data.html` 来自后端数据库中的 `ParsedText` 字段，是已经经过多层净化的受信 HTML。
+`data.html` 来自后端数据库中的 `ParsedText` 字段，是已经过多层净化的受信 HTML。
 
 ### 6.2 htmlRender UX 增强
 **代码位置**：[Editor/utils/index.ts:40-124](file:///d:/fz/0601-2/solo-dogfeeding/code/16-answer/ui/src/components/Editor/utils/index.ts#L40-L124)
 
-对已渲染的 DOM 做纯前端优化（**不涉及安全边界扩展**）：
+对已渲染的 DOM 做纯前端优化：
 
-| 处理 | 作用 |
-|------|------|
-| LaTeX `<br>` 替换 | 修复公式块内 `<br>` 导致的渲染异常 |
-| 表格样式包装 | 给 `<table>` 加 Bootstrap `.table .table-bordered` 并套 `.table-responsive` |
-| 外链加 nofollow | 判断 `a.href` origin 与当前站点不同则加 `rel="nofollow"` |
-| 代码块复制按钮 | 给 `<pre>` 加复制按钮和 Tooltip |
+| 处理 | 作用 | 安全边界影响 |
+|------|------|-------------|
+| LaTeX `<br>` 替换 | 修复公式块内 `<br>` 导致的渲染异常 | 使用 `p.innerHTML` 赋值，但操作对象是公式段落内的已知标签 |
+| 表格样式包装 | 给 `<table>` 加 Bootstrap class 并套 `.table-responsive` | 使用 `createElement` + `replaceChild`，不涉及 innerHTML 注入 |
+| 外链加 nofollow | 判断 `a.href` origin 与当前站点不同则加 `rel="nofollow"` | **这是后端取消 nofollow 后的安全兜底**——只有外链加 nofollow，站内链接不加 |
+| 代码块复制按钮 | 给 `<pre>` 加复制按钮和 Tooltip | 使用 `codeTool.innerHTML` 插入按钮 HTML，但内容为硬编码模板字符串 |
 
 ### 6.3 前端插件渲染钩子
 **代码位置**：[pluginKit/index.ts:328-366](file:///d:/fz/0601-2/solo-dogfeeding/code/16-answer/ui/src/utils/pluginKit/index.ts#L328-L366)
 
 ```typescript
-const useRenderHtmlPlugin = (element) => {
+const useRenderHtmlPlugin = (element: HTMLElement | RefObject<HTMLElement> | null) => {
     plugins.getPlugins()
         .filter(p => p.activated && p.hooks?.useRender
             && (p.info.type === PluginType.Editor || p.info.type === PluginType.Render))
@@ -218,8 +264,12 @@ const useRenderHtmlPlugin = (element) => {
 };
 ```
 
-- 插件只能操作**已渲染完成、已净化**的 DOM 节点
-- 插件不参与 HTML 生成阶段，无法绕过后端净化管道
+插件接收的是**已渲染完成、已净化的 DOM 元素引用**，但此引用是可写的——插件完全可以调用 `element.innerHTML = '...'` 注入任意 HTML，或 `document.createElement('script')` 插入脚本。
+
+**安全边界不是技术性的，而是信任性的**：
+- 插件代码由站点管理员安装，属于受信代码
+- 插件处于 `activated` 状态才被调用，管理员可随时禁用
+- 攻击面 = 恶意插件 或 被入侵的插件源
 
 ---
 
@@ -243,28 +293,32 @@ const useRenderHtmlPlugin = (element) => {
 | 钩子 | 作用 | 安全边界 |
 |------|------|---------|
 | `EditorReplacement` | 替换整个编辑器组件 | 仍通过 `/answer/api/v1/post/render` 获取预览 HTML |
-| `useRender` / `useRenderHtmlPlugin` | 对已渲染 DOM 增强 | 只读/修改已净化 DOM，不接触原始 HTML 生成 |
+| `useRender` / `useRenderHtmlPlugin` | 对已渲染 DOM 增强 | 接收 DOM 元素引用，**技术上可修改 innerHTML、创建 script 等**；安全性依赖插件受信 |
 | 工具栏 PluginSlot | 编辑器工具栏扩展 | 仅注入 UI 按钮，不绕过 Markdown 解析 |
 
 ### 7.3 扩展点设计原则
 1. **HTML 生成权完全在后端**：前端预览也走后端 `Markdown2HTML` 接口，不存在两套渲染逻辑
 2. **插件不介入 HTML 生成核心管道**：Filter/Parser 虽定义接口但当前 Markdown2HTML 主流程未直接调用，避免插件引入 XSS 漏洞
 3. **插件可被禁用隔离**：除 Base 插件外，所有功能插件均可被管理员关闭
-4. **title 属性的 @embed? 约定**：为嵌入插件保留的最小化后门，值被严格正则约束，不能执行脚本
+4. **title 属性的 @embed? 约定**：为嵌入插件保留的最小化附加规则，值被正则 `^@embed?$` 严格约束为固定字面量，不可注入脚本
+5. **两道 bluemonday 策略隔离**：第 1 层内嵌的 RawHTML 过滤使用严格默认 UGCPolicy，第 2 层全局过滤使用放宽版 UGCPolicy——即使第 2 层放宽了 URL 校验，第 1 层的 RawHTML 仍受严格约束
 
 ---
 
 ## 八、逐层降险总表
 
-| 层级 | 位置 | 防护机制 | 降低的风险 |
-|------|------|---------|-----------|
-| 1 | Goldmark `DangerousHTMLRenderer` | RawHTML 逐段 Sanitize、URL 合法性校验、SecureWrite | 内联 `<script>`、`javascript:` 协议、恶意事件属性 |
-| 2 | Bluemonday UGCPolicy + 自定义规则 | 标签白名单、属性白名单 + 正则约束、style 受控放行 | 危险标签（iframe/form/object）、危险属性（on*/srcdoc）、非法 title 值 |
-| 3 | Service `UpdateQuestionLink` | 验证 ID 存在后才替换链接、href 由服务端格式化构造 | 伪造的站内链接 ID、href 注入 |
-| 4 | ReviewService + Reviewer 插件 | 内容审核打标，非 Approved 不展示 | 垃圾内容、违规内容、未过审内容对外暴露 |
-| 5 | 前端 `dangerouslySetInnerHTML` | 只渲染后端 ParsedText，不渲染用户原文 | 前端自行拼接 HTML 导致的注入 |
-| 6 | 前端 `htmlRender` | 外链自动加 nofollow、DOM 结构受控改造 | 外链权重流失、UX 问题（非安全，但为防御性设计） |
-| 7 | 前端 `useRenderHtmlPlugin` | 插件只读/改已净化 DOM | 恶意插件扩展 XSS 面 |
+| 层级 | 位置 | 防护机制 | 降低的风险 | 引入的放宽 |
+|------|------|---------|-----------|-----------|
+| 1a | `renderRawHTML` | 默认 UGCPolicy 逐段过滤（nofollow=true, ParseableURLs=true） | 内联 `<script>`、危险标签、危险属性、不可解析 URL | `<kbd>` 原样放行（低风险） |
+| 1b | `renderHTMLBlock` | `SecureWrite` HTML 实体转义 | 块级原始 HTML 完全文本化，不可能执行 | 无 |
+| 1c | `renderLink` | IsURL + IsDangerousURL + EscapeHTML + URLEscape | `javascript:` 等危险协议、href 注入 | 无 |
+| 1d | `renderAutoLink` | IsURL + EscapeHTML + URLEscape（无 IsDangerousURL） | 格式非法 URL、href 注入 | 缺少 IsDangerousURL，由 govalidator.IsURL 兜底 |
+| 2 | Bluemonday 放宽版 UGCPolicy | 标签白名单 + 属性白名单 + 正则约束 | 漏过第 1 层的危险标签/属性 | 取消 nofollow、取消 URL 解析校验、允许 style 属性 |
+| 3 | `UpdateQuestionLink` | 验证 ID 存在后才替换链接、href 服务端格式化 | 伪造站内链接 ID、href 注入 | 无 |
+| 4 | ReviewService | 内容审核打标，非 Approved 不展示 | 垃圾/违规内容对外暴露 | 无 |
+| 5 | `dangerouslySetInnerHTML` | 只渲染后端 ParsedText | 前端自行拼接 HTML 导致的注入 | 无 |
+| 6 | `htmlRender` | 外链自动加 nofollow（补后端放宽的缺口） | 外链权重流失 | 无（非安全层，UX 增强） |
+| 7 | `useRenderHtmlPlugin` | 插件接收已净化 DOM | — | **插件可写 DOM，安全性依赖信任边界** |
 
 ---
 
