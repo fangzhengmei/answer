@@ -462,17 +462,40 @@ if len(msg.RevisionID) > 0 {
 }
 ```
 
-`ActivityMsg.RevisionID` 非空时才写入 `activity.RevisionID`。各场景：
+`ActivityMsg.RevisionID` 非空时才写入 `activity.RevisionID`。审核通过后实际上会产生两条 Activity，两条 Activity 各有用途、互不重复，**不会导致问题时间线出现两条修订展示**：
 
-| 场景 | Activity 类型 | 带 RevisionID | 说明 |
-|------|-----------|---------------|------|
-| 问题免审核编辑 | `question.edited` | 是 | 立即发送，ID=新创建的 revision.ID（`question_service.go` L1071-L1077） |
-| 问题审核通过编辑 | `question.edited` | 是 | 审核通过后发送，ID=被审核的 revision.ID（`revision_service.go` L224-L230） |
-| 问题审核通过（声望） | `edit.accepted` | 是 | 单独一条 Activity，给修改者加声望，`HasRank=1`（`repo/activity/review_repo.go` L68-L125） |
-| 提问 | `question.asked` | 是 | 创建问题时也产生首个 revision |
-| 投票/评论/关闭等 | 对应类型 | 否 | 与内容版本无关，不关联 revision |
+| 场景 | Activity Key | 写入方式 | OriginalObjectID | ObjectID | HasRank | RevisionID | 进入问题时间线？ | 作用 |
+|------|--------------|----------|-------------------|----------|---------|------------|-----------------|------|
+| 问题免审核编辑 | `question.edited` | `activityQueueService.Send` → `HandleActivity` | 问题 ID | 问题 ID | 0（HandleActivity 未设置，默认为 0） | 新 revision.ID | ✅ 是 | 时间线展示"edited"修订行，展开后按 revision_id 对比新旧版本 |
+| 问题审核通过编辑 | `question.edited` | `activityQueueService.Send` → `HandleActivity` | 问题 ID | 问题 ID | 0 | 被审核的 revision.ID | ✅ 是 | 同上（和免审核编辑产生的是同一条时间线项，`activity_type = edited`，一条修订只出现一次） |
+| 问题审核通过（声望） | `edit.accepted` | `reviewActivity.Review()` 直接写 DB（不走 HandleActivity） | **`"0"`** | 问题 ID | **`1`**，`Rank=config["edit.accepted"].Value=2` | 被审核的 revision.ID | ❌ 否 | 只用于给修改者加声望；因 `OriginalObjectID="0"`，时间线查询 `OriginalObjectID=问题ID` 时不会命中；即使命中也会被前端 `activity_type="accept"` 渲染为采纳链接而非修订展开按钮 |
+| 提问 | `question.asked` | `activityQueueService.Send` → `HandleActivity` | 问题 ID | 问题 ID | 0 | 首个 revision.ID | ✅ 是 | 时间线展示"asked"行 |
+| 投票/评论/关闭等 | 对应类型 | `activityQueueService.Send` → `HandleActivity` | 问题 ID / 回答 ID | 对象 ID | 视配置而定 | 无 | 视类型而定 | 与内容版本无关 |
 
-一个"审核通过"的编辑会产生两条 Activity：一条 `question.edited`（时间线展示内容变化），另一条 `edit.accepted`（给修改者加声望）。两条都带同一个 `RevisionID`。
+**为什么审核通过后不会出现两条修订行：**
+
+1. **`question.edited` 才是修订展示来源**：它的 `OriginalObjectID=问题ID`，会被 `GetObjectAllActivity` 命中；经 `strings.Cut("question.edited", ".")` 取后半段得到 `"edited"`，再经 `formatActivity` 原样返回（isHidden=false）；前端 `Item/index.tsx` L74-L90 中 `activity_type === 'edited'` 匹配展开按钮渲染条件，点击时按 `revision_id` 拉取 Diff 内容。
+2. **`edit.accepted` 不进入时间线**：它的 `OriginalObjectID = "0"`（写死在 `revision_service.go` L161），而时间线查询条件是 `OriginalObjectID = objectID`（问题 ID），在 SQL 层就被过滤掉，根本不会出现在时间线返回数组里。
+3. **`edit.accepted` 即使被查到也不会渲染成修订行**：假设绕过查询条件，其 `cfg.Key="edit.accepted"` 经 `strings.Cut` 后得到 `"accepted"`，`formatActivity("accepted")` 返回 `(false, "accept")`，前端 `Item/index.tsx` L91-L96 对 `activity_type === 'accept'` 会渲染为采纳链接（跳转到回答页），不在"有展开按钮的修订类型"列表（edited / asked / rollback / created / answered）中。
+
+**两条 Activity 各自写入的字段对照**（`question.edited` vs `edit.accepted`）：
+
+| 字段 | `question.edited`（HandleActivity） | `edit.accepted`（ReviewActivityRepo.Review） |
+|------|-------------------------------------|---------------------------------------------|
+| UserID | `msg.UserID`（修改人） | `act.UserID`（修改人） |
+| TriggerUserID | `msg.TriggerUserID` | `act.TriggerUserID`（审核人） |
+| ObjectID | `uid.DeShortID(msg.ObjectID)`（问题ID） | `act.ObjectID`（问题ID） |
+| OriginalObjectID | `uid.DeShortID(msg.OriginalObjectID)`（**问题ID**） | `act.OriginalObjectID`（**"0"**，硬编码，写 review_service.go L161） |
+| ActivityType | `config["question.edited"].ID` | `config["edit.accepted"].ID` |
+| Rank | 未设置（0） | `config["edit.accepted"].Value = 2` |
+| HasRank | 未设置（0） | **`1`** |
+| RevisionID | `converter.StringToInt64(msg.RevisionID)` | `converter.StringToInt64(act.RevisionID)` |
+| Cancelled | `ActivityAvailable`（0） | 未设置（0） |
+
+**写入路径的区别**：
+
+- `question.edited` 通过 **活动队列** `activityQueueService.Send(ctx, msg)` → 异步消费者 `ActivityCommon.HandleActivity` → `activityRepo.AddActivity` 入库（`internal/service/activity_common/activity.go` L68-L91）。
+- `edit.accepted` **不走活动队列**，直接在 `RevisionAudit` 中同步调用 `reviewActivity.Review()`（`internal/repo/activity/review_repo.go` L69-L125），在同一个 DB 事务里完成用户 Rank 变更 + Activity 插入，并做了去重判断（`user_id + activity_type + revision_id` 三元组唯一）。
 
 ### 4.3 展开行：根据修订编号读新旧版本内容
 
