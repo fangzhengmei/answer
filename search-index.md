@@ -52,22 +52,48 @@
 
 索引更新采用**触发式**设计，在实体增删改操作后主动更新搜索索引。
 
-#### 2.1.1 触发点
+#### 2.1.1 触发点详细分类
 
-**问题实体** — [question_repo.go](file:///d:/fz/0601-2/solo-dogfeeding/code/35-answer/internal/repo/question/question_repo.go)
+索引更新触发点按操作语义可以分为以下几类，其中**置顶(pin)、展示(show)属性不同步**，**创建后的补写在 service 层触发**而非 repo 层。
 
-| 操作 | 函数 | 行号 |
-|------|------|------|
-| 添加问题 | `AddQuestion` | L101 |
-| 更新问题 | `UpdateQuestion` | L112 |
-| 更新问题状态 | `UpdateQuestionStatus` | L156 |
-| 更新问题操作属性 | `UpdateQuestionOperation` | L201 |
-| 更新问题标签 | (service 层调用) | L220, L230 |
-| 软删除 | `UpdateQuestionStatus` | L156 |
+##### 问题实体 — 创建与内容变更
 
-**回答实体** — [answer_repo.go](file:///d:/fz/0601-2/solo-dogfeeding/code/35-answer/internal/repo/answer/answer_repo.go)
+| 操作 | 触发位置 | 调用时机 | 行号 | 说明 |
+|------|----------|----------|------|------|
+| **创建后补写** | question_service.go | 问题入库 + 标签关联完成后 | L415 | `AddQuestion()` 创建时 repo 层**不触发**，由 service 层在 `ChangeTag` 之后补调 `UpdateSearch`，确保标签已写入后再建索引 |
+| 更新问题内容 | question_repo.go | 标题/正文等字段更新后 | L101 | `UpdateQuestion()` 直接触发 |
+| 更新问题标签 | question_service.go | 标签增删改后（服务层多处） | L415 等 | 标签变更由 service 层统一触发 |
 
-内部方法 `updateSearch` 在回答创建、更新、状态变更时被调用。
+##### 问题实体 — 状态与计数变更
+
+| 操作 | 函数 | 行号 | 说明 |
+|------|------|------|------|
+| 浏览量 +1 | `UpdatePvCount` | L112 | 每次访问问题页面时触发 |
+| 回答数变更 | `UpdateAnswerCount` | L124 | 回答增删后触发 |
+| 状态变更（软删除/恢复等） | `UpdateQuestionStatus` | L156 | 含状态变更时触发 |
+| 状态变更（不更新时间） | `UpdateQuestionStatusWithOutUpdateTime` | L166 | 仅更新 status 字段也触发 |
+| 恢复删除 | `RecoverQuestion` | L201 | 将 status 从删除态恢复为可用 |
+| **置顶(pin) / 展示(show)** | `UpdateQuestionOperation` | L205-L212 | **不触发** UpdateSearch！这两个操作属性不同步到索引 |
+| 采纳答案变更 | `UpdateAccepted` | L220 | `accepted_answer_id` 变更时触发，影响 `HasAccepted` 字段 |
+| 最后回答 ID 变更 | `UpdateLastAnswer` | L230 | 新回答或回答删除时更新 |
+| 批量软删除用户所有问题 | `RemoveAllUserQuestion` | L664-L666 | 循环逐个触发 |
+| 物理永久删除 | `DeletePermanentlyQuestions` | L170-L192 | **不触发**，直接 DELETE 已删除状态的数据 |
+
+> **关键差异**：[UpdateQuestionOperation](file:///d:/fz/0601-2/solo-dogfeeding/code/35-answer/internal/repo/question/question_repo.go#L205-L212) 只更新 `pin` 和 `show` 两列，但没有调用 `UpdateSearch`。这意味着搜索索引中不区分置顶和普通问题，搜索结果不会因置顶而加权。同时问题创建流程中，[question_repo.AddQuestion](file:///d:/fz/0601-2/solo-dogfeeding/code/35-answer/internal/repo/question/question_repo.go#L66-L79) 本身不触发搜索更新，而是在 [question_service.AddQuestion](file:///d:/fz/0601-2/solo-dogfeeding/code/35-answer/internal/service/content/question_service.go#L415) 的 `ChangeTag` 之后补调，确保标签关联已写入。
+
+##### 回答实体
+
+| 操作 | 函数 | 行号 | 说明 |
+|------|------|------|------|
+| 创建回答 | `AddAnswer` | L83 | 创建后触发 `updateSearch` |
+| 软删除回答 | `RemoveAnswer` | L96 | 软删除（status → deleted）后触发 |
+| 恢复回答 | `RecoverAnswer` | L109 | 从删除态恢复后触发 |
+| 批量软删除用户所有回答 | `RemoveAllUserAnswer` | L141-L143 | 循环逐个触发 |
+| 更新回答内容 | `UpdateAnswer` | L155 | 字段更新后触发 |
+| 回答状态变更 | `UpdateAnswerStatus` | L165 | 审核/删除等状态变更 |
+| 采纳状态变更 | `UpdateAnswerAccepted` | L254 | 问题采纳/取消采纳该回答时触发 |
+
+所有回答实体的索引更新都通过私有方法 [updateSearch](file:///d:/fz/0601-2/solo-dogfeeding/code/35-answer/internal/repo/answer/answer_repo.go#L462) 统一调用。
 
 #### 2.1.2 更新流程
 
