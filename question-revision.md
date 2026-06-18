@@ -385,7 +385,7 @@ if (type === 'question') {
 }
 ```
 
-#### Diff 渲染（DiffContent 组件`ui/src/components/DiffContent/index.tsx`）
+#### Diff 渲染（DiffContent 组件，见 `ui/src/components/DiffContent/index.tsx`）
 
 - **标题 Diff**：调用 `diffText(newTitle, oldTitle)`，把 `<` 转义后用 `dangerouslySetInnerHTML` 渲染。
 - **标签 Diff**：分别计算 `addTags` 和 `deleteTags`；新增标签加 `state='add'`，删除加 `state='delete'`，并按原位置插入；CSS 类 `.review-text-add / .review-text-delete` 上色。
