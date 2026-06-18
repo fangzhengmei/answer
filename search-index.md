@@ -68,18 +68,25 @@
 
 | 操作 | 函数 | 行号 | 说明 |
 |------|------|------|------|
-| 浏览量 +1 | `UpdatePvCount` | L112 | 每次访问问题页面时触发 |
-| 回答数变更 | `UpdateAnswerCount` | L124 | 回答增删后触发 |
-| 状态变更（软删除/恢复等） | `UpdateQuestionStatus` | L156 | 含状态变更时触发 |
-| 状态变更（不更新时间） | `UpdateQuestionStatusWithOutUpdateTime` | L166 | 仅更新 status 字段也触发 |
-| 恢复删除 | `RecoverQuestion` | L201 | 将 status 从删除态恢复为可用 |
+| 浏览量 +1 | `UpdatePvCount` | L105-L114 | 每次访问问题页面时触发，**存在空 ID 边界问题** |
+| 回答数变更 | `UpdateAnswerCount` | L116-L126 | 回答增删后触发，**存在空 ID 边界问题** |
+| 状态变更（软删除/恢复等） | `UpdateQuestionStatus` | L150-L158 | 含状态变更时触发 |
+| 状态变更（不更新时间） | `UpdateQuestionStatusWithOutUpdateTime` | L160-L168 | 仅更新 status 字段也触发 |
+| 恢复删除 | `RecoverQuestion` | L195-L203 | 将 status 从删除态恢复为可用 |
 | **置顶(pin) / 展示(show)** | `UpdateQuestionOperation` | L205-L212 | **不触发** UpdateSearch！这两个操作属性不同步到索引 |
-| 采纳答案变更 | `UpdateAccepted` | L220 | `accepted_answer_id` 变更时触发，影响 `HasAccepted` 字段 |
-| 最后回答 ID 变更 | `UpdateLastAnswer` | L230 | 新回答或回答删除时更新 |
+| 采纳答案变更 | `UpdateAccepted` | L214-L222 | `accepted_answer_id` 变更时触发，影响 `HasAccepted` 字段 |
+| 最后回答 ID 变更 | `UpdateLastAnswer` | L224-L232 | 新回答或回答删除时更新 |
 | 批量软删除用户所有问题 | `RemoveAllUserQuestion` | L664-L666 | 循环逐个触发 |
 | 物理永久删除 | `DeletePermanentlyQuestions` | L170-L192 | **不触发**，直接 DELETE 已删除状态的数据 |
 
-> **关键差异**：[UpdateQuestionOperation](file:///d:/fz/0601-2/solo-dogfeeding/code/35-answer/internal/repo/question/question_repo.go#L205-L212) 只更新 `pin` 和 `show` 两列，但没有调用 `UpdateSearch`。这意味着搜索索引中不区分置顶和普通问题，搜索结果不会因置顶而加权。同时问题创建流程中，[question_repo.AddQuestion](file:///d:/fz/0601-2/solo-dogfeeding/code/35-answer/internal/repo/question/question_repo.go#L66-L79) 本身不触发搜索更新，而是在 [question_service.AddQuestion](file:///d:/fz/0601-2/solo-dogfeeding/code/35-answer/internal/service/content/question_service.go#L415) 的 `ChangeTag` 之后补调，确保标签关联已写入。
+> **关键差异 1：pin/show 属性不同步**
+> [UpdateQuestionOperation](file:///d:/fz/0601-2/solo-dogfeeding/code/35-answer/internal/repo/question/question_repo.go#L205-L212) 只更新 `pin` 和 `show` 两列，但没有调用 `UpdateSearch`。这意味着搜索索引中不区分置顶和普通问题，搜索结果不会因置顶而加权。
+>
+> **关键差异 2：创建后补写在 service 层触发**
+> 问题创建流程中，[question_repo.AddQuestion](file:///d:/fz/0601-2/solo-dogfeeding/code/35-answer/internal/repo/question/question_repo.go#L66-L79) 本身不触发搜索更新，而是在 [question_service.AddQuestion](file:///d:/fz/0601-2/solo-dogfeeding/code/35-answer/internal/service/content/question_service.go#L415) 的 `ChangeTag` 之后补调，确保标签关联已写入。
+>
+> **边界问题：浏览量/回答数更新传递空对象 ID**
+> `UpdatePvCount` 和 `UpdateAnswerCount` 存在隐蔽的 Bug：方法内部创建了新的空 `Question{}` 对象，DB 更新后未回填 ID，导致传给 `UpdateSearch(ctx, question.ID)` 的是**空字符串**。由于 `UpdateSearch` 内有 `!exist` 检查会静默返回，这两个高频操作实际上**不会触发任何索引更新**。详见 [2.1.3 空 ID 边界问题分析](#213-空-id-边界问题分析)。
 
 ##### 回答实体
 
@@ -199,6 +206,27 @@ _ = plugin.CallSearch(func(search plugin.Search) error {
 | Active | int64 | 最后活跃时间戳 |
 | Score | int64 | 投票得分 |
 | HasAccepted | bool | 是否有采纳答案 |
+
+> **索引字段注意**：问题的 `pin`（置顶）和 `show`（展示）两个属性**不写入搜索索引**，因为 `UpdateQuestionOperation` 方法不触发 `UpdateSearch`。这意味着搜索结果中置顶问题不会获得加权，展示属性也不会作为过滤条件。如果需要按置顶排序，必须额外回库查询 `pin` 字段再进行二次排序。
+
+#### 2.3.1 索引字段与数据库字段映射
+
+| SearchContent 字段 | 问题实体 (entity.Question) | 回答实体 (entity.Answer) |
+|-------------------|---------------------------|--------------------------|
+| ObjectID | question.ID | answer.ID |
+| Title | question.Title | 关联 question.Title |
+| Type | constant.QuestionObjectType ("question") | constant.AnswerObjectType ("answer") |
+| Content | question.OriginalText | answer.OriginalText |
+| Answers | question.AnswerCount | 0 |
+| Status | question.Status (1=可用, 10=已删除) | answer.Status |
+| Tags | tag_rel 查询标签 ID 列表 | (空，回答本身无标签) |
+| QuestionID | question.ID | answer.QuestionID |
+| UserID | question.UserID | answer.UserID |
+| Views | question.ViewCount | (无，回答不统计浏览量) |
+| Created | question.CreatedAt.Unix() | answer.CreatedAt.Unix() |
+| Active | question.UpdatedAt.Unix() | answer.UpdatedAt.Unix() |
+| Score | question.VoteCount | answer.VoteCount |
+| HasAccepted | question.AcceptedAnswerID != "" | answer.Adopted |
 
 ---
 
