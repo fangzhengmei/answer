@@ -26,7 +26,7 @@
 
 定义：`internal/entity/review_entity.go`
 
-> Review 用于**新发布内容**的审核（新问题、新回答），**问题修改走的是 Revision 机制**，两者分离。Review 表只处理 `1=Pending` / `2=Approved` / `3=Rejected` 状态。
+> Review 用于新发布内容的审核（新问题、新回答），问题修改走的是 Revision 机制，两者分离。Review 表只处理 `1=Pending` / `2=Approved` / `3=Rejected` 状态。
 
 ### 0.3 活动（Activity）实体
 
@@ -36,18 +36,18 @@
 |------|------|
 | `ActivityType` | 活动类型（int，映射自 `config` 表中 `question.edited` 等 key 的 ID） |
 | `ObjectID` / `OriginalObjectID` | 关联对象 ID |
-| `RevisionID` | **关联到 Revision.ID（int64），Activity 与 Revision 的关联字段** |
+| `RevisionID` | 关联到 Revision.ID（int64），Activity 与 Revision 的关联字段 |
 | `UserID` / `TriggerUserID` | 对象作者 / 触发人（例如编辑人） |
 | `Cancelled` | 是否已被撤销（0=有效，1=已撤销） |
 
-Revision 与 Activity 是 **1:N 关系：一个 Revision 可能关联 0~2 条 Activity（见第 4.2 节）。
+Revision 与 Activity 是 1:N 关系：一个 Revision 可能关联 0 至 2 条 Activity（见第 4.2 节）。
 
 ---
 
 ## 1. 提交流程（用户提交修改）
 
 ```
-前端编辑页 (ui/src/pages/Questions/Ask/index.tsx
+前端编辑页 ui/src/pages/Questions/Ask/index.tsx
     ↓ modifyQuestion()
 Controller: UpdateQuestion [PUT /answer/api/v1/question]
     ↓ rankService.CheckOperationPermissionsForRanks()
@@ -80,10 +80,10 @@ API 层：服务方法 `modifyQuestion` → `PUT /answer/api/v1/question`（`ui/
 canList, requireRanks, err := qc.rankService.CheckOperationPermissionsForRanks(ctx, req.UserID, []string{
     permission.QuestionEdit,                // canList[0]
     permission.QuestionDelete,              // canList[1]
-    permission.QuestionEditWithoutReview, // canList[2]  ★ 免审核
-    permission.TagUseReservedTag,             // canList[3]
+    permission.QuestionEditWithoutReview,   // canList[2]  免审核
+    permission.TagUseReservedTag,           // canList[3]
     permission.TagAdd,                      // canList[4]
-    permission.LinkUrlLimit,              // canList[5]
+    permission.LinkUrlLimit,                // canList[5]
 })
 
 // L657：判断是否是对象所有者（问题作者）
@@ -91,14 +91,14 @@ objectOwner := qc.rankService.CheckOperationObjectOwner(ctx, req.UserID, req.ID)
 
 // L658-L660：拼装到 req
 req.CanEdit = canList[0] || objectOwner
-req.NoNeedReview = canList[2] || objectOwner   // ★ 核心分流点
+req.NoNeedReview = canList[2] || objectOwner   // 核心分流点
 req.CanUseReservedTag = canList[3]
 ```
 
 **其他前置校验**：
 
-- `UpdateQuestionCheckTags()`：校验标签变更（保留标签不能被删、新增保留标签需权限。
-- 检查是否有**未完成审核中的修订**（在 Service 层，见 1.3）。
+- `UpdateQuestionCheckTags()`：校验标签变更（保留标签不能被删、新增保留标签需权限）。
+- 检查是否有未完成审核中的修订（在 Service 层，见 1.3）。
 - 新增标签权限校验。
 
 **响应**：`UpdateQuestionResp{ UrlTitle, WaitForReview: !req.NoNeedReview }`。
@@ -131,7 +131,7 @@ if dbinfo.Title == req.Title && dbinfo.OriginalText == req.Content && !isChange 
 
 #### 步骤 3：权限分流（见下节第 2 部分）
 
-根据 `req.NoNeedReview` 决定是**直接写库**还是**仅创建待审核修订**。
+根据 `req.NoNeedReview` 决定是直接写库还是仅创建待审核修订。
 
 #### 步骤 4：创建 Revision 记录
 
@@ -143,7 +143,7 @@ revisionDTO := &schema.AddRevisionDTO{
     UserID:   question.UserID,     // 若需审核会被覆盖为 req.UserID
     ObjectID: question.ID,
     Title:    question.Title,
-    Log:      req.EditSummary,  // 修改摘要
+    Log:      req.EditSummary,     // 修改摘要
 }
 ```
 
@@ -157,7 +157,7 @@ revisionDTO.Content = string(infoJSON)
 revisionID, err := qs.revisionService.AddRevision(ctx, revisionDTO, true)
 ```
 
-`autoUpdateRevisionID=true`：表示**立即**把新 revision ID 写到问题表的 `revision_id` 字段（免审核路径直接生效；待审核路径也会更新，但仅当审核通过后正式把内容覆盖。Repo 层实现在 `internal/repo/revision/revision_repo.go` L57-L85 `AddRevision` —— 在同一个事务里先 `Insert(revision)` 再 `UpdateObjectRevisionId`。
+`autoUpdateRevisionID=true`：表示立即把新 revision ID 写到问题表的 `revision_id` 字段（免审核路径直接生效；待审核路径也会更新，但仅当审核通过后正式把内容覆盖）。Repo 层实现在 `internal/repo/revision/revision_repo.go` L57-L85 `AddRevision` —— 在同一个事务里先 `Insert(revision)` 再 `UpdateObjectRevisionId`。
 
 #### 步骤 5：免审核路径的额外操作
 
@@ -182,7 +182,7 @@ req.NoNeedReview = canList[2] || objectOwner
 // canList[2] 对应 permission.QuestionEditWithoutReview
 ```
 
-即满足**任一**条件即免审核：
+即满足任一条件即免审核：
 
 1. 用户拥有 `rank.question.edit_without_review` 权限（声望达标或角色授权）。
 2. 用户是问题作者（`ObjectCreatorUserID == UserID`）。
@@ -239,8 +239,8 @@ if !canUpdate {
 | 环节 | 免审核（NoNeedReview=true） | 需审核（NoNeedReview=false） |
 |------|---------------------------|----------------------------|
 | revision.Status | `2(ReviewPass)` | `1(Unreviewed)` |
-| question 主表 | 立即更新标题/正文 | **不变** |
-| 标签关系 | 立即变更 | **不变** |
+| question 主表 | 立即更新标题/正文 | 不变 |
+| 标签关系 | 立即变更 | 不变 |
 | revision_id | 更新 | 也更新（问题被修改） |
 | 活动事件 | 立刻发送 ActQuestionEdited | 审核通过后发送 |
 | 用户可见效果 | 修改立即生效 | 仍显示旧版本 |
@@ -258,7 +258,7 @@ canList, _ := rc.rankService.CheckOperationPermissions(ctx, req.UserID, []string
 })
 ```
 
-审核操作在 Service 内还会再做一次**对象类型匹配校验`internal/service/content/revision_service.go` L132-L148：
+审核操作在 Service 内还会再做一次对象类型匹配校验（`internal/service/content/revision_service.go` L132-L148）：
 
 - 问题修订 → 必须有 `CanReviewQuestion`。
 - 回答修订 → 必须有 `CanReviewAnswer`。
@@ -294,11 +294,11 @@ RevisionService.RevisionAudit()
 
 **Service**：`internal/service/content/revision_service.go` L338-L381 `GetUnreviewedRevisionPage`。
 
-- 通过 `req.GetCanReviewObjectTypes()` 按审核权限**过滤对象类型，只能看到自己有权审核的那类修订。
-- 取数据库中 `status=1(Unreviewed)` 的 revision 记录（pageSize=1，**一次只取一条，前端"跳过"按钮就是翻页）。
+- 通过 `req.GetCanReviewObjectTypes()` 按审核权限过滤对象类型，只能看到自己有权审核的那类修订。
+- 取数据库中 `status=1(Unreviewed)` 的 revision 记录（pageSize=1，一次只取一条，前端"跳过"按钮就是翻页）。
 - 同时组装两块信息：
-  - `info` → 当前**线上版本**（从 question/answer/tag 主表读取，作为 oldData）。
-  - `unreviewed_info` → **待审核版本**（从 revision.content 反序列化，作为 newData）。
+  - `info` → 当前线上版本（从 question/answer/tag 主表读取，作为 oldData）。
+  - `unreviewed_info` → 待审核版本（从 revision.content 反序列化，作为 newData）。
 - 返回结构 `GetUnreviewedRevisionResp{ Type, Info, UnreviewedInfo }`。
 
 ### 3.2 审核操作（Approve/Reject）
@@ -317,7 +317,7 @@ if req.Operation == schema.RevisionAuditReject {
 }
 ```
 
-问题主表**不做任何改动，修订记录保留供追溯。**Reject ** 不会产生任何活动记录。
+问题主表不做任何改动，修订记录保留供追溯。Reject 不会产生任何活动记录。
 
 #### 通过（Approve）— 以问题为例 `revisionAuditQuestion`
 
@@ -352,7 +352,7 @@ func (rs *RevisionService) revisionAuditQuestion(ctx context.Context, revisionit
 // ① 更新 revision 状态为 2（ReviewPass）
 rs.revisionRepo.UpdateStatus(ctx, req.ID, entity.RevisionReviewPassStatus, req.UserID)
 
-// ② 记录"审核通过"类型的活动（edit.accepted"，见 4.2 节）
+// ② 记录"审核通过"类型的活动（edit.accepted，见 4.2 节）
 rs.reviewActivity.Review(ctx, &schema.PassReviewActivity{...})
 
 // ③ 通知作者：您的修改已被采纳（成就类站内信）
@@ -365,9 +365,9 @@ rs.notificationQueueService.Send(ctx, &schema.NotificationMsg{
 
 ## 4. 变更展示
 
-变更展示分两块：**审核时的 Diff 对比** 和 **历史版本时间线**。本节按代码详细说明。
+变更展示分三块：审核时的 Diff 对比、历史版本时间线、拒绝修订不外显。本节按代码精确对齐。
 
-### 4.1 审核页面的 Diff 展示
+### 4.1 审核页面的 Diff 对比
 
 **前端组件**：`ui/src/pages/Review/components/SuggestContent/index.tsx`。
 
@@ -399,141 +399,202 @@ if (type === 'question') {
 - **Reject** → `revisionAudit(id, 'reject')`，同样加载下一条。
 - **Skip** → `page+1` 跳过（不改变 revision 状态）。
 
-### 4.2 历史版本时间线
+### 4.2 主时间线：活动记录查询生成时间线
 
-#### 时间线数据来源
+前端入口：`ui/src/pages/Timeline/index.tsx`。
 
-时间线页面：`ui/src/pages/Timeline/index.tsx`。
-
-前端通过 `getTimelineData()` → `GET /answer/api/v1/activity/timeline`（`ui/src/services/client/timeline.ts`）。
+前端调用链：`getTimelineData({ object_id, show_vote })`（`ui/src/services/client/timeline.ts`）→ `GET /answer/api/v1/activity/timeline`。
 
 后端入口：`internal/controller/activity_controller.go` L53-L68 `GetObjectTimeline`。
 
-**核心 Service**：`internal/service/activity/activity.go` L93-L165 `GetObjectTimeline`。
+后端 Service：`internal/service/activity/activity.go` L93-L165 `GetObjectTimeline`。
 
-时间线数据有两个来源，按 ID 倒序合并展示：
+**核心结论：主时间线完全由 `activity` 表生成，列表阶段不查询 revision 表内容，revision.ID 仅作为引用字段保存在时间线项中。**
 
-**来源 1：Activity 表（活动记录）**
+#### 步骤 1：查 activity 表
 
-- 通过 `activityRepo.GetObjectAllActivity(ctx, req.ObjectID, req.ShowVote)`（`internal/repo/activity/activity_repo.go` L52-L66）。SQL 按 `id DESC` 查 `activity` 表。`OriginalObjectID = objectID` 的全部活动。
-
-- 活动类型映射（`internal/base/constant/acticity.go`）：
-  - `question.asked`（提问）
-  - `question.edited`（编辑）
-  - `question.closed` / `question.reopened`
-  - `question.answered`（有新回答）
-  - `question.accept`（采纳回答）
-  - `question.upvote` / `question.downvote`（投票）
-  - `question.rollback`（回滚）
-  - `question.deleted` / `question.undeleted`
-  - `question.pin` / `question.unpin`
-  - 以及回答、标签的对应活动。
-
-格式化为前端可读字符串（`internal/service/activity/activity.go` L433-L449 `formatActivity`）：
-- `vote_up` → `upvote`
-- `vote_down` → `downvote`
-- `accepted` → `accept`
-- `voted_up` / `voted_down` / `follow` → **隐藏（isHidden=true，L434-L438）。
-
-**来源 2：Revision 表（修订详情）**
-
-时间线本身**不是直接查 Revision 表，而是通过 Activity 的 `RevisionID` 字段关联到 Revision。
-
-`ActObjectTimeline` 结构（`internal/schema/activity.go` L51-L62）：
+`GetObjectTimeline` L109 调用 `activityRepo.GetObjectAllActivity(ctx, req.ObjectID, req.ShowVote)`，Repo 层在 `internal/repo/activity/activity_repo.go` L52-L66：
 
 ```go
-type ActObjectTimeline struct {
-    ActivityID   string         `json:"activity_id"`
-    RevisionID   string         `json:"revision_id"`  // ★ 关联到 revision.id
-    ActivityType string         `json:"activity_type"`
-    Comment      string         `json:"comment"`
-    ...
+session := ar.data.DB.Context(ctx).Desc("id")
+if !showVote {
+    session.NotIn("activity_type", activityTypeNotShown)   // 排除 voted_up、voted_down 等投票类
 }
+err = session.Find(&activityList, &entity.Activity{OriginalObjectID: objectID})
 ```
 
-Activity 和 Revision 的关系（**不是所有 Activity 都关联 Revision。关联规则（`internal/service/activity_common/activity.go` L69-L90 `HandleActivity`）：
+- 查询条件：`OriginalObjectID = objectID`（是 `OriginalObjectID` 字段，不是 `ObjectID`）。
+- 排序：`id DESC`（活动自增 ID 倒序，最新活动在前）。
+- `show_vote=false` 时排除 `VoteActivityTypeList` 中的活动类型。
+
+#### 步骤 2：每条 activity 组装为时间线项
+
+`GetObjectTimeline` L113-L162 遍历 activityList，逐条构造 `ActObjectTimeline`（结构定义在 `internal/schema/activity.go` L51-L62）：
+
+| 字段 | 来源 | 说明 |
+|------|------|------|
+| `RevisionID` | `converter.IntToString(act.RevisionID)` | 直接从 activity 表取，**不查 revision 表** |
+| `ActivityType` | `strings.Cut(cfg.Key, ".")` 取后半段 → `formatActivity()` | 配置表 `config.id → cfg.Key`（如 42 → `question.edited` → `edited`） |
+| `Comment` | `getTimelineActivityComment()` 按类型填充 | edited 类型时才会真正去查 revision 表（见下） |
+| `UserInfo.ID` | `act.TriggerUserID`（优先）/ `act.UserID` | down vote 非管理员时 Username="N/A" |
+| `Cancelled` | `act.Cancelled == entity.ActivityCancelled` | 被撤销的活动仍展示，但带取消标记 |
+
+**隐藏过滤**：`formatActivity()`（`internal/service/activity/activity.go` L433-L449）对 `voted_up` / `voted_down` / `follow` 返回 `isHidden=true`，直接 `continue` 跳过，不出现在返回数组中。`vote_up` → `upvote`，`vote_down` → `downvote`，`accepted` → `accept`。
+
+#### 步骤 3：Comment 字段按需读取 revision.Log（edit_summary）
+
+`GetObjectTimeline` L160 调用 `getTimelineActivityComment()`（`internal/service/activity/activity.go` L199-L233），按类型分支：
+
+- **`objectType == comment`** → 取 `commentCommonService.GetComment(objectID).ParsedText`。
+- **`activityType == edited`** → 真正查 revision 表：`revisionService.GetRevision(ctx, revisionID)`，返回 `converter.Markdown2HTML(revision.Log)`（即用户填写的修改摘要，经 Markdown 转 HTML）。
+- **`activityType == closed`** → 取 meta 表的关闭原因。
+- 其他类型 → 空字符串。
+
+**仅在 edited 活动上才会额外访问一次 revision 表**，其他活动类型在列表阶段不查 revision。
+
+#### Activity 与 Revision 的关联规则
+
+关联字段写入规则在 `internal/service/activity_common/activity.go` L84-L86 `HandleActivity`：
 
 ```go
-// 当 ActivityMsg.RevisionID 非空时才写入 activity.RevisionID
 if len(msg.RevisionID) > 0 {
     act.RevisionID = converter.StringToInt64(msg.RevisionID)
 }
 ```
 
-所以：
+`ActivityMsg.RevisionID` 非空时才写入 `activity.RevisionID`。各场景：
 
-| 场景 | Activity 类型 | 是否带 RevisionID | 说明 |
-|------|-----------|-------------------|------|
-| 问题免审核编辑 | `question.edited` | ✅ 是（`question_service.go` L1071-L1077） | 立即发送，`RevisionID=新创建的 revision.ID |
-| 问题审核通过编辑 | `question.edited` | ✅ 是（`revision_service.go` L224-L230） | 审核通过后发送，RevisionID=被审核的 revision.ID |
-| 问题审核通过（声望） | `edit.accepted` | ✅ 是（`repo/activity/review_repo.go` L68-L125） | 单独一条 Activity，给修改者加声望 |
-| 提问 `question.asked` | ✅ 是（创建问题时也会产生首个 revision） |
-| 投票/评论/关闭等 | ❌ 否 | 与内容版本无关，不关联 revision |
+| 场景 | Activity 类型 | 带 RevisionID | 说明 |
+|------|-----------|---------------|------|
+| 问题免审核编辑 | `question.edited` | 是 | 立即发送，ID=新创建的 revision.ID（`question_service.go` L1071-L1077） |
+| 问题审核通过编辑 | `question.edited` | 是 | 审核通过后发送，ID=被审核的 revision.ID（`revision_service.go` L224-L230） |
+| 问题审核通过（声望） | `edit.accepted` | 是 | 单独一条 Activity，给修改者加声望，`HasRank=1`（`repo/activity/review_repo.go` L68-L125） |
+| 提问 | `question.asked` | 是 | 创建问题时也产生首个 revision |
+| 投票/评论/关闭等 | 对应类型 | 否 | 与内容版本无关，不关联 revision |
 
-一个"审核通过"的编辑会产生**两条 Activity**（`question.edited`（用于时间线展示内容变化，另一条 `edit.accepted`（用于给修改者加声望，HasRank=1）。两条 Activity 都带同一个 RevisionID。
+一个"审核通过"的编辑会产生两条 Activity：一条 `question.edited`（时间线展示内容变化），另一条 `edit.accepted`（给修改者加声望）。两条都带同一个 `RevisionID`。
 
-#### 时间线评论区 Comment 字段来源：`internal/service/activity/activity.go` L199-L233 `getTimelineActivityComment`：
+### 4.3 展开行：根据修订编号读新旧版本内容
 
-```go
-if activityType == constant.ActEdited {   // "edited"
-    revision, err := as.revisionService.GetRevision(ctx, revisionID)
-    // 返回 revision.Log（用户填写的修改摘要）Markdown2HTML(revision.Log)
-}
-```
+主时间线返回的 `ActObjectTimeline.RevisionID` 是字符串，前端在点击展开时根据该编号查询详情。
 
-即时间线中"edited"那一行的评论文字就是 revision.Log（edit_summary）。
+#### 前端：计算新旧版本编号
 
-#### 时间线详情接口（点击时间线某一行展开）：`GET /answer/api/v1/activity/timeline/detail`。
-
-**入口**：`internal/controller/activity_controller.go` L78-L89 `GetObjectTimelineDetail`。
-
-**Service**：`internal/service/activity/activity.go` L261-L274 `GetObjectTimelineDetail`。
-
-参数 `new_revision_id` 和 `old_revision_id` 分别反序列化出两个 Revision.Content 字段，返回 `{NewRevision, OldRevision}`。
-
-前端 `ui/src/pages/Timeline/components/Item/index.tsx` L44-L63 `handleItemClick`：
+`ui/src/pages/Timeline/index.tsx` L98-L99 先从返回的时间线里筛出带修订编号的子集：
 
 ```ts
-// revisionList = timeline.filter(item => item.revision_id > 0)
-// 找点击项在 revisionList 中的位置 idIndex
-// oldId = revisionList[idIndex + 1].revision_id（即前一个版本）
-// 第一个版本 oldId = 0
-getTimelineDetail({ new_revision_id, old_revision_id: oldId })
+const revisionList =
+    timelineData?.timeline?.filter((item) => item.revision_id > 0) || [];
 ```
 
-然后用 `DiffContent` 组件渲染两个版本差异（同审核页面同一个 DiffContent`）。
+`ui/src/pages/Timeline/components/Item/index.tsx` L44-L63 `handleItemClick` 根据点击项在 revisionList 中的索引找相邻版本：
 
-### 4.3 拒绝修订（Status=3）是否展示？
+```ts
+const revisionItem = revisionList?.find((v) => v.revision_id === id);
+let oldId;
+if (revisionList?.length > 0 && revisionItem) {
+  const idIndex = revisionList.indexOf(revisionItem) || 0;
+  if (idIndex === revisionList.length - 1) {
+    oldId = 0;                       // 最后一项 = 最早版本，无旧版本可对比
+  } else {
+    oldId = revisionList[idIndex + 1].revision_id;   // 列表按时间倒序，下一项 = 更早的版本
+  }
+}
+const res = await getTimelineDetail({ new_revision_id: id, old_revision_id: oldId });
+```
 
-**结论：拒绝修订在对外不展示。**
+- `new_revision_id` = 被点击行的 revision_id。
+- `old_revision_id` = revisionList 中下一项的 revision_id（更早的版本）。如果是最早一项则为 `"0"`。
 
-核查代码确认：
+#### 后端：按修订编号直接读取 revision 内容
 
-1. **时间线接口（public revision 列表接口（public revision list endpoint`internal/service/content/revision_service.go` L383-L427 `GetRevisionList` → 调用 `revisionRepo.GetRevisionList`。
+请求 `GET /answer/api/v1/activity/timeline/detail`（`ui/src/services/client/timeline.ts` `getTimelineDetail`）。
 
-2. **Repo 层 `internal/repo/revision/revision_repo.go` L175-L185：
+Controller：`internal/controller/activity_controller.go` L78-L89 `GetObjectTimelineDetail`。
+
+Service：`internal/service/activity/activity.go` L261-L274 `GetObjectTimelineDetail`：
 
 ```go
-func (rr *revisionRepo) GetRevisionList(ctx context.Context, revision *entity.Revision) (revisionList []entity.Revision, err error) {
-    revisionList = []entity.Revision{}
-    err = rr.data.DB.Context(ctx).Where(builder.Eq{
-        "object_id": revision.ObjectID,
-    }).OrderBy("created_at DESC").Find(&revisionList)
+// 校验新旧 revision 所属对象对当前用户的可见性（校验对象，不校验 revision.Status）
+ensureTimelineRevisionVisible(ctx, req.NewRevisionID, req.UserID, req.IsAdminModerator)
+ensureTimelineRevisionVisible(ctx, req.OldRevisionID, req.UserID, req.IsAdminModerator)
+resp.OldRevision, _ = as.getOneObjectDetail(ctx, req.OldRevisionID)
+resp.NewRevision, _ = as.getOneObjectDetail(ctx, req.NewRevisionID)
+```
+
+`ensureTimelineRevisionVisible`（L276-L286）逻辑：`revisionID == "0"` 直接通过；否则取 revision → 取 objectInfo → `validateTimelineObjectVisibility` 检查对象是否对该用户可见（已删除/未审核的问题，非作者非管理员不可见）。**该函数不校验 revision.Status。**
+
+`getOneObjectDetail`（L372-L431）按 ID 读 revision 并反序列化快照：
+
+```go
+if revisionID == "0" {
+    return nil, nil                              // "0" 表示无旧版本，返回 nil
+}
+revision, err := as.revisionService.GetRevision(ctx, revisionID)   // 按 ID 直接读，不过滤 status
+objInfo, _ := as.objectInfoService.GetInfo(ctx, revision.ObjectID)
+switch objInfo.ObjectType {
+case constant.QuestionObjectType:
+    data := &entity.QuestionWithTagsRevision{}
+    json.Unmarshal([]byte(revision.Content), data)     // 反序列化 revision.Content 快照
+    resp.Title = data.Title
+    resp.OriginalText = data.OriginalText
+    // ... 循环组装 Tags
+case constant.AnswerObjectType:
+    data := &entity.Answer{}
+    json.Unmarshal([]byte(revision.Content), data)
+    resp.OriginalText = data.OriginalText
+case constant.TagObjectType:
+    data := &entity.Tag{}
+    json.Unmarshal([]byte(revision.Content), data)
+    resp.Title = data.DisplayName
 }
 ```
 
-Repo 层**没有过滤 Status 过滤**，全量返回。但上层 Service `parseItem()` 反序列化 Content 时**不区分状态，Status 字段被序列化为 JSON（`internal/schema/revision_schema.go` L93-L108 `GetRevisionResp.Status`）。
+- `revisionID == "0"` → 返回 nil。
+- `revisionService.GetRevision` 按 ID 直接读取，**不校验 revision.Status**。
+- 按对象类型 `json.Unmarshal(revision.Content)` 反序列化当时的完整快照，提取 Title / OriginalText / Tags。
+- 返回 `{NewRevision, OldRevision}`，前端用 `DiffContent` 组件渲染两个版本差异（与审核页面同一个组件）。
 
-3. **时间线接口走 Activity，而拒绝修订不会出现在时间线上，因为：
+### 4.4 拒绝修订（Status=3）不外显
 
-   - 拒绝修订**不会写入 Activity**（`revision_service.go` L117-L119 Reject 分支只 `UpdateStatus`，不发送 Activity。
-   - 没有 Activity → 时间线不会出现这行。
+**结论：拒绝修订对外展示不可见。** 代码中有三条机制分别在不同入口保证这一点，数据库中拒绝修订记录（status=3）仍保留供追溯。
 
-4. **审核队列**（`/revisions/unreviewed）只查 `status=1`（Unreviewed）（`internal/repo/revision/revision_repo.go` L201-L218 `GetUnreviewedRevisionPage`），拒绝的修订（status=3）不会出现在审核队列。
+#### 机制 1：主时间线不出现（无 Activity）
 
-5. **前端**：`ui/src/pages/Timeline/index.tsx` L98-L99 `revisionList = timeline.filter(item => item.revision_id > 0) —— 只过滤出有 revision_id 的时间线项（即只有 Activity 关联到的 Revision。
+主时间线来源于 `activity` 表。Reject 分支（`internal/service/content/revision_service.go` L117-L119）只调用 `UpdateStatus` 改状态为 3，**不发送任何 Activity**：
 
-**总结：拒绝修订**不会在公开历史中不可见，但数据库里保留记录（status=3），不会出现在任何公开页面。
+```go
+if req.Operation == schema.RevisionAuditReject {
+    err = rs.revisionRepo.UpdateStatus(ctx, req.ID, entity.RevisionReviewRejectStatus, req.UserID)
+    return
+}
+```
+
+没有对应 Activity → 时间线列表不会有该行 → 前端 `revisionList = timeline.filter(item => item.revision_id > 0)` 也不会包含该 revision_id → 点击展开时不会请求该修订的详情。
+
+#### 机制 2：修订列表接口在控制器层过滤 status
+
+`GET /answer/api/v1/revisions` 的 Controller（`internal/controller/revision_controller.go` L63-L84）在拿到 Service 全量结果后显式过滤：
+
+```go
+resp, err := rc.revisionListService.GetRevisionList(ctx, req)
+list := make([]schema.GetRevisionResp, 0)
+for _, item := range resp {
+    if item.Status == entity.RevisionNormalStatus || item.Status == entity.RevisionReviewPassStatus {
+        list = append(list, item)      // 只保留 status ∈ {0, 2}
+    }
+}
+```
+
+Repo 层 `GetRevisionList`（`internal/repo/revision/revision_repo.go` L175-L185）确实不过滤状态、全量返回，但 Controller 层只放行 `Normal(0)` 和 `ReviewPass(2)`，`Reject(3)` 和 `Unreviewed(1)` 都被剔除。
+
+#### 机制 3：审核队列只查待审核状态
+
+审核队列 `GET /answer/api/v1/revisions/unreviewed` 的 Repo 层 `GetUnreviewedRevisionPage`（`internal/repo/revision/revision_repo.go` L201-L218）只查 `status=1`（Unreviewed），拒绝（3）也不会再出现在审核队列。
+
+#### 补充：详情端点本身不校验状态
+
+需注意 `getOneObjectDetail`（见 4.3）按 ID 直接读 revision 内容，不校验 revision.Status。理论上知道拒绝修订的 ID 且对象可见时能读到内容，但因机制 1 保证拒绝修订的 ID 不会进入时间线列表，正常 UI 流程无法触达该端点读取拒绝修订内容。
 
 ---
 
@@ -559,7 +620,7 @@ Repo 层**没有过滤 Status 过滤**，全量返回。但上层 Service `parse
 
 ```
                        ┌──────────────────────────┐
-                       │   用户点击"编辑问题"     │
+                       │   用户点击"编辑问题"      │
                        └────────────┬─────────────┘
                                     │
                                     ▼
@@ -570,13 +631,13 @@ Repo 层**没有过滤 Status 过滤**，全量返回。但上层 Service `parse
                                ▼
                ┌───────────────────────────────────────┐
                │ 用户提交 modifyQuestion(title,content,│
-               │          tags, edit_summary, captcha) │
+               │          tags, edit_summary, captcha)  │
                └───────────────┬───────────────────────┘
                                │
                                ▼
       ┌────────────────────────────────────────────────────┐
-      │ Controller.UpdateQuestion                         │
-      │  ① rank 检查 6 项权限                              │
+      │ Controller.UpdateQuestion                          │
+      │  ① rank 检查 6 项权限                               │
       │  ② objectOwner = 是否作者                          │
       │  ③ NoNeedReview = EditWithoutReview ∥ objectOwner │
       └───────────────────────┬────────────────────────────┘
@@ -588,7 +649,7 @@ Repo 层**没有过滤 Status 过滤**，全量返回。但上层 Service `parse
               ▼                               ▼
   ① 写 question 主表(title/text)    ① 不写主表，仅创建 revision
   ② 同步标签变更                    ② revision.Status = 1 (Unreviewed)
-  ③ revision.Status = 2 (Pass)     ③ 前端提示"等待审核"
+  ③ revision.Status = 2 (Pass)      ③ 前端提示"等待审核"
   ④ 发送 ActQuestionEdited
   ⑤ 问题立即展示新版本              ┌─────────────────────┐
               │                    │ 审核人浏览审核队列  │
@@ -598,21 +659,23 @@ Repo 层**没有过滤 Status 过滤**，全量返回。但上层 Service `parse
               │                               │ DiffContent
               │                               ▼
               │                    ┌──────────────────────┐
-              │                    │ Approve  │  Reject    │
-              │                    └────┬─────┴─────┬──────┘
+              │                    │ Approve  │  Reject   │
+              │                    └────┬─────┴─────┬─────┘
               │                         │           │
               │                         ▼           ▼
               │            revisionAuditQuestion()  Status=3(Reject)
-              │              ① 写 question 主表
-              │              ② 同步标签
+              │              ① 写 question 主表     (不产生 Activity)
+              │              ② 同步标签             → 时间线不出现
               │              ③ revision.Status = 2
-              │              ④ 活动（edit.accepted + 声望)
+              │              ④ 活动 (edit.accepted + 声望)
               │              ⑤ ActQuestionEdited 活动
               │              ⑥ 通知作者
               └────────────────────────►│
                                         ▼
                           ┌─────────────────────────┐
-                          │ 问题详情展示最新版本     │
-                          │ Timeline 列出历史修订（经 Activity → Revision│
+                          │ 问题详情展示最新版本    │
+                          │ Timeline 活动列表       │
+                          │ (Activity 表生成)       │
+                          │ 展开→按 revision_id 读 │
                           └─────────────────────────┘
 ```
