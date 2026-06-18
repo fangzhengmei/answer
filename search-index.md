@@ -578,17 +578,35 @@ func NewCache(c *CacheConf) (cache.Cache, func(), error) {
 
 #### 6.3.1 搜索回填流程概览
 
-无论是内置搜索还是插件搜索，最终都要走**回填 (backfill)** 流程把数据库原始行转换成前端响应：
+无论是内置搜索还是插件搜索，最终都要走**回填 (backfill)** 流程把数据库原始行转换成前端响应。插件搜索和内置搜索的回填链路有差异：
 
+**插件搜索回填（两条路径：主数据逐条查询 + 标签/用户批量查询**
 ```
-搜索结果 ID / 原始行
-  → parseResult / ParseSearchPluginResult
-    ├─ 问题/回答主数据（标题、正文）← 已由 SQL 查询返回，无需额外查库
-    ├─ BatchGetObjectTag(questionIDs)  ← 批量 SQL 查询，无缓存
-    │   └─ tag_rel_repo.BatchGetObjectTagRelList → SELECT tag_rel WHERE object_id IN (...)
-    │   └─ tagCommonRepo.GetTagListByIDs         → SELECT tag WHERE id IN (...)
-    └─ BatchUserBasicInfoByID(userIDs)  ← 批量 SQL 查询，无缓存
-        └─ userRepo.BatchGetByID                 → SELECT user WHERE id IN (...)
+plugin.Search.SearchContents  → 插件返回 ID 列表
+  → searchRepo.ParseSearchPluginResult
+    ├─ for _, r := range sres            ← 循环逐条回库
+    │   ├─ r.Type == "question"
+    │   │   → SELECT ... FROM question WHERE id = r.ID        ← 单条 SQL
+    │   └─ r.Type == "answer"
+    │       → SELECT ... FROM answer LEFT JOIN question
+    │           ON question.id = answer.question_id
+    │           WHERE answer.id = r.ID                               ← 单条 SQL
+    │
+    ├─ 收集 questionIDs = [id1, id2, ...]
+    ├─ 收集 userIDs     = [uid1, uid2, ...]
+    ├─ tagCommon.BatchGetObjectTag(ctx, questionIDs)      ← 批量 SQL: WHERE object_id IN (...)
+    └─ userCommon.BatchUserBasicInfoByID(ctx, userIDs)    ← 批量 SQL: WHERE id IN (...)
+```
+
+**内置搜索回填（一条 SQL + 标签/用户批量查询）
+```
+searchRepo.SearchContents → UNION ALL SQL 一次查出所有结果
+  → searchRepo.parseResult
+    ├─ 问题/回答主数据 ← 已由 UNION ALL SQL 一次性返回
+    ├─ 收集 questionIDs = [id1, id2, ...]
+    ├─ 收集 userIDs     = [uid1, uid2, ...]
+    ├─ tagCommon.BatchGetObjectTag(ctx, questionIDs)      ← 批量 SQL: WHERE object_id IN (...)
+    └─ userCommon.BatchUserBasicInfoByID(ctx, userIDs)    ← 批量 SQL: WHERE id IN (...)
 ```
 
 #### 6.3.2 直接批量查库的路径（完全不经过缓存）
