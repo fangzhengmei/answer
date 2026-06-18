@@ -572,19 +572,73 @@ func NewCache(c *CacheConf) (cache.Cache, func(), error) {
 }
 ```
 
-### 6.3 缓存与搜索的协作
+### 6.3 缓存与搜索的协作：回填链路精确分析
 
-搜索系统通过 `data.Cache` 间接使用缓存，主要场景：
+搜索流程中，缓存层 (`data.Cache`) 的使用非常有限。搜索回填阶段涉及的**核心数据全部通过批量 SQL 查询取数**，完全不经过 `data.Cache`。以下按调用链路分层说明：
 
-1. **标签信息缓存**：`tagCommon.BatchGetObjectTag` 可能缓存标签数据
-2. **用户信息缓存**：`userCommon.BatchUserBasicInfoByID` 批量获取用户时使用缓存
-3. **搜索结果无直接缓存**：搜索请求本身不做结果缓存，每次实时查询
+#### 6.3.1 搜索回填流程概览
 
-> 注意：搜索结果的缓存策略由搜索插件自行实现，核心系统不提供搜索结果缓存。
+无论是内置搜索还是插件搜索，最终都要走**回填 (backfill)** 流程把数据库原始行转换成前端响应：
 
-### 6.4 插件配置缓存
+```
+搜索结果 ID / 原始行
+  → parseResult / ParseSearchPluginResult
+    ├─ 问题/回答主数据（标题、正文）← 已由 SQL 查询返回，无需额外查库
+    ├─ BatchGetObjectTag(questionIDs)  ← 批量 SQL 查询，无缓存
+    │   └─ tag_rel_repo.BatchGetObjectTagRelList → SELECT tag_rel WHERE object_id IN (...)
+    │   └─ tagCommonRepo.GetTagListByIDs         → SELECT tag WHERE id IN (...)
+    └─ BatchUserBasicInfoByID(userIDs)  ← 批量 SQL 查询，无缓存
+        └─ userRepo.BatchGetByID                 → SELECT user WHERE id IN (...)
+```
 
-在 [plugin_common_service.go#L180-L183](file:///d:/fz/0601-2/solo-dogfeeding/code/35-answer/internal/service/plugin_common/plugin_common_service.go#L180-L183) 中，当缓存插件启用时会替换 `data.Cache`：
+#### 6.3.2 直接批量查库的路径（完全不经过缓存）
+
+以下回填步骤**全部通过批量 SQL 查询取数**，不经过 `data.Cache`，**没有任何缓存读取或写入**：
+
+| 回填步骤 | 实现方法 | SQL 行为 | 数据来源 |
+|----------|----------|----------|----------|
+| 问题/回答本身 | `SearchContents` / `SearchQuestions` / `SearchAnswers` | `SELECT ... FROM question/answer` + `UNION ALL` | 直接查库 |
+| 插件搜索回填 | `ParseSearchPluginResult` | `SELECT ... FROM question WHERE id IN (...)` | 直接查库 |
+| 标签关联关系 | `tag_rel_repo.BatchGetObjectTagRelList` | `SELECT * FROM tag_rel WHERE object_id IN (...)` | 批量查库 [tag_rel_repo.go#L165-L176](file:///d:/fz/0601-2/solo-dogfeeding/code/35-answer/internal/repo/tag/tag_rel_repo.go#L165-L176) |
+| 标签详情 | `tagCommonRepo.GetTagListByIDs` | `SELECT * FROM tag WHERE id IN (...)` | 批量查库 [tag_common_repo.go#L56-L64](file:///d:/fz/0601-2/solo-dogfeeding/code/35-answer/internal/repo/tag_common/tag_common_repo.go#L56-L64) |
+| 用户信息 | `userRepo.BatchGetByID` | `SELECT * FROM user WHERE id IN (...)` | 批量查库 [user_repo.go#L203-L210](file:///d:/fz/0601-2/solo-dogfeeding/code/35-answer/internal/repo/user/user_repo.go#L203-L210) |
+| 查询解析阶段查标签 | `tagCommonRepo.GetTagBySlugName` | `SELECT * FROM tag WHERE slug_name = ?` | 直接查库 [tag_common_repo.go#L68-L77](file:///d:/fz/0601-2/solo-dogfeeding/code/35-answer/internal/repo/tag_common/tag_common_repo.go#L68-L77) |
+| 查询解析阶段查用户 | `userCommon.GetUserBasicInfoByUserName` | `SELECT * FROM user WHERE username = ?` | 直接查库 |
+
+> 代码验证：对 `search_common`、`content`、`tag`、`user` 等目录搜索 `Cache` / `cache` / `GetString` / `SetString`，**搜索回填相关的 service 和 repo 层完全没有引用 `data.Cache`**。标签和用户这两个高频回填对象在 repo 层也没有任何缓存逻辑，全部走 `WHERE id IN (...)` 批量查询。
+
+#### 6.3.3 搜索请求本身没有结果缓存
+
+- 搜索请求（`/search` API）**完全不做结果缓存**，每次都实时查询数据库或调用搜索插件
+- 内置搜索：每次请求都重新执行 `LIKE` SQL 查询，无任何缓存中间层
+- 插件搜索：由搜索插件（如 ES/Meilisearch）自行决定内部是否有 query cache，核心系统不干预也不感知
+- 索引更新的 `UpdateSearch` 也不写任何缓存，直接调用插件接口
+
+系统定义的全部缓存 Key 见 [cache_key.go](file:///d:/fz/0601-2/solo-dogfeeding/code/35-answer/internal/base/constant/cache_key.go)，其中**没有任何搜索相关的缓存 Key**。
+
+#### 6.3.4 其他功能才大量使用缓存层
+
+`data.Cache` 缓存层主要被**非搜索功能**大量使用：
+
+| 功能模块 | 缓存位置 | 缓存 Key 前缀 | 用途 |
+|----------|----------|--------------|------|
+| 用户登录认证 | `authService` | `UserTokenCacheKey` / `UserVisitTokenCacheKey` | 存储登录态 Token |
+| 用户状态校验 | `authService` | `UserStatusChangedCacheKey` | 标记用户状态变更 |
+| 站点配置 | `siteInfoCommonService` | `SiteInfoCacheKey` / `ConfigID2KEYCacheKeyPrefix` | 站点信息、配置项缓存 |
+| 邮件验证码 | `userService` | `UserEmailCodeCacheKey` | 存储邮件验证码 |
+| 第三方登录 | `oauthService` | `ConnectorUserExternalInfoCacheKey` | 存储外部登录临时信息 |
+| 站点地图 | `sitemapService` | `SiteMapQuestionCacheKeyPrefix` | 缓存 sitemap XML |
+| 限流防刷 | 中间件 | `RateLimitCacheKeyPrefix` | API 限流计数 |
+| 消息红点 | `notificationService` | `RedDotCacheKey` | 未读消息红点状态 |
+| 新问题通知限频 | `notificationService` | `NewQuestionNotificationLimitCacheKeyPrefix` | 通知发送频率限制 |
+
+搜索回填中仅有的间接缓存使用：
+- `FormatAvatar` / `FormatListAvatar` 格式化头像时读取站点配置缓存（非搜索核心数据）
+- 请求进入时的鉴权阶段已读取用户 Token 缓存（搜索流程不主动访问）
+
+#### 6.3.5 缓存热替换机制
+
+在 [plugin_common_service.go#L180-L183](file:///d:/fz/0601-2/solo-dogfeeding/code/35-answer/internal/service/plugin_common/plugin_common_service.go#L180-L183) 中，当缓存插件启用时会直接替换 `data.Cache`：
 
 ```go
 _ = plugin.CallCache(func(cache plugin.Cache) error {
@@ -593,7 +647,7 @@ _ = plugin.CallCache(func(cache plugin.Cache) error {
 })
 ```
 
-这意味着缓存插件可以热替换整个系统的缓存层。
+这意味着缓存插件可以在运行时热替换整个系统的缓存层，但由于搜索回填链路不使用 `data.Cache`，**缓存插件的启停对搜索性能无直接影响**。只有站点配置、用户鉴权等外围模块会感知到缓存层的变化。
 
 ---
 
@@ -674,23 +728,40 @@ question_service.UpdateQuestion
 ```
 search_controller.Search
   → searchService.Search
-    → searchParser.ParseStructure
-      → parseTags → tagCommonService.GetTagBySlugName
-      → parseUserID → userCommon.GetUserBasicInfoByUserName
+    → searchParser.ParseStructure                    ← 解析查询语法
+      → parseTags → tagCommonService.GetTagBySlugName  ← 直接查库(tag)
+      → parseUserID → userCommon.GetUserBasicInfoByUserName  ← 直接查库(user)
       → parseVotes / parseViews / parseAnswers ...
     → 判断是否有搜索插件
-    ├─ 有插件 → plugin.Search.SearchContents
-    │           → searchRepo.ParseSearchPluginResult
-    │             → tagCommon.BatchGetObjectTag
-    │             → userCommon.BatchUserBasicInfoByID
-    └─ 无插件 → searchRepo.SearchContents (UNION ALL 查询)
-                → parseResult
-                  → htmltext.FetchMatchedExcerpt
-                  → tagCommon.BatchGetObjectTag
-                  → userCommon.BatchUserBasicInfoByID
+    ├─ 有插件 → plugin.Search.SearchContents         ← 插件返回 ID + 排序分数
+    │           → searchRepo.ParseSearchPluginResult   ← 回填：
+    │             → SELECT question/answer WHERE id IN  ← 直接查库
+    │             → tagCommon.BatchGetObjectTag          ← 批量查库(tag_rel+tag)
+    │             → userCommon.BatchUserBasicInfoByID    ← 批量查库(user)
+    └─ 无插件 → searchRepo.SearchContents (UNION ALL)    ← LIKE 查询
+                → parseResult                             ← 回填：
+                  → htmltext.FetchMatchedExcerpt          ← 纯内存计算
+                  → tagCommon.BatchGetObjectTag           ← 批量查库(tag_rel+tag)
+                  → userCommon.BatchUserBasicInfoByID     ← 批量查库(user)
 ```
 
-### 9.3 全量同步调用链
+> 注意：整个回填链路（标签 `WHERE object_id IN (...)` + `WHERE id IN (...)`、用户 `WHERE id IN (...)`、主数据查询）**全部通过批量 SQL 查库**，不经过 `data.Cache`。只有头像格式化等外围操作会间接读取站点配置缓存。
+
+### 9.3 浏览量/回答数更新的静默失败调用链
+
+```
+question_view_controller.VisitQuestion
+  → questionRepo.UpdatePvCount(questionID)            ← 传入正确 questionID
+    → question := &entity.Question{}                    ← 创建空对象，ID=""
+    → DB.Incr("view_count", 1).Update(question)         ← DB 更新成功，但不回填 ID
+    → qr.UpdateSearch(ctx, question.ID)                 ← 传 question.ID = ""（空字符串）
+      → GetQuestion(ctx, "")                            ← 查询不到
+        → !exist → return                                ← 静默返回，索引不更新
+```
+
+> 相同问题存在于 `UpdateAnswerCount`。后果：索引中 `Views` 和 `Answers` 字段永远是初始值。
+
+### 9.4 全量同步调用链
 
 ```
 plugin_common_service.UpdatePluginConfig
